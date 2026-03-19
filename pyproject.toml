@@ -1,0 +1,27 @@
+[project]
+name = "vibevoice-mlx"
+version = "0.1.0"
+description = "MLX inference for Microsoft VibeVoice multi-speaker TTS on Apple Silicon"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = [
+    "mlx>=0.22.0",
+    "soundfile",
+    "transformers>=4.40.0",
+    "huggingface_hub",
+    "safetensors",
+]
+
+[project.optional-dependencies]
+coreml = ["coremltools>=9.0"]
+convert = ["torch>=2.5.0"]
+
+[project.urls]
+Repository = "https://github.com/gafiatulin/vibevoice-mlx"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["run"]
