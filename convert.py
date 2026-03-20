@@ -173,10 +173,10 @@ git clone https://github.com/gafiatulin/vibevoice-mlx && cd vibevoice-mlx
 uv sync
 
 # Basic synthesis (weights download automatically)
-vibevoice-mlx{model_arg} --text "Hello, world!" --output hello.wav
+uv run vibevoice-mlx{model_arg} --text "Hello, world!" --output hello.wav
 
 # Voice cloning
-vibevoice-mlx{model_arg} \\
+uv run vibevoice-mlx{model_arg} \\
   --ref-audio speaker.wav --text "Clone this voice" --output cloned.wav
 ```
 """

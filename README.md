@@ -12,27 +12,27 @@ git clone https://github.com/gafiatulin/vibevoice-mlx && cd vibevoice-mlx
 uv sync
 
 # Basic synthesis (model downloads automatically)
-vibevoice-mlx --text "Hello, world!" --output hello.wav
+uv run vibevoice-mlx --text "Hello, world!" --output hello.wav
 
 # Voice cloning
-vibevoice-mlx \
+uv run vibevoice-mlx \
   --ref-audio speaker.wav --text "Clone this voice" --output cloned.wav
 
 # Encode a voice for reuse (one-time)
-vibevoice-mlx \
+uv run vibevoice-mlx \
   --ref-audio speaker.wav --save-voice voice.safetensors
 
 # Synthesize with saved voice
-vibevoice-mlx \
+uv run vibevoice-mlx \
   --voice voice.safetensors --text "Hello again!" --output hello.wav
 
 # Multi-speaker voice cloning
-vibevoice-mlx \
+uv run vibevoice-mlx \
   --ref-audio spk1.wav spk2.wav \
   --text "Speaker 1: Hello.\nSpeaker 2: Hi there." --output dialogue.wav
 
 # With quantization for faster generation
-vibevoice-mlx --quantize 8 --text "Hello, world!"
+uv run vibevoice-mlx --quantize 8 --text "Hello, world!"
 ```
 
 ## Performance
