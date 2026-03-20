@@ -34,7 +34,7 @@ TOKENIZER_IDS = {
 SHARD_SIZE = 5 * 1024 * 1024 * 1024
 
 
-def convert_model(model_id: str, tag: str, output_dir: Path):
+def convert_model(model_id: str, tag: str, output_dir: Path, hf_prefix: str = "gafiatulin"):
     """Convert a VibeVoice model to MLX format."""
     print(f"\n{'='*60}")
     print(f"Converting {model_id}")
@@ -98,7 +98,7 @@ def convert_model(model_id: str, tag: str, output_dir: Path):
     _copy_tokenizer(output_dir, TOKENIZER_IDS[tag])
 
     # Model card
-    _write_model_card(output_dir, model_id, tag)
+    _write_model_card(output_dir, model_id, tag, hf_prefix)
 
     total_mb = sum(f.stat().st_size for f in output_dir.glob("*")) / 1e6
     print(f"  Saved to {output_dir} ({total_mb:.0f} MB)")
@@ -150,7 +150,8 @@ def _copy_tokenizer(output_dir: Path, tokenizer_id: str):
     print(f"  Tokenizer saved from {tokenizer_id}")
 
 
-def _write_model_card(output_dir: Path, model_id: str, tag: str):
+def _write_model_card(output_dir: Path, model_id: str, tag: str, hf_prefix: str):
+    model_arg = "" if tag == "1.5b" else f"\n  --model {hf_prefix}/vibevoice-{tag}-mlx "
     card = f"""---
 license: mit
 base_model: {model_id}
@@ -159,19 +160,27 @@ tags:
   - tts
   - vibevoice
   - apple-silicon
+  - voice-cloning
 ---
 
-# VibeVoice MLX - {tag.upper()}
+# VibeVoice MLX — {tag.upper()}
 
-MLX-converted weights for [{model_id}](https://huggingface.co/{model_id}).
+MLX-converted fp16 weights for [{model_id}](https://huggingface.co/{model_id}).
 
-## Usage
+For inference code, benchmarks, and documentation see [vibevoice-mlx](https://github.com/gafiatulin/vibevoice-mlx).
+
+## Quick start
 
 ```bash
-pip install mlx soundfile transformers huggingface_hub safetensors
 git clone https://github.com/gafiatulin/vibevoice-mlx && cd vibevoice-mlx
+uv sync
 
-python run/e2e_pipeline.py --model vibevoice-{tag}-mlx --text "Hello, world!" --output hello.wav
+# Basic synthesis (weights download automatically)
+uv run python run/e2e_pipeline.py{model_arg} --text "Hello, world!" --output hello.wav
+
+# Voice cloning
+uv run python run/e2e_pipeline.py{model_arg} \\
+  --ref-audio speaker.wav --text "Clone this voice" --output cloned.wav
 ```
 """
     (output_dir / "README.md").write_text(card)
@@ -200,7 +209,7 @@ def main():
     for tag in args.models:
         model_id = MODEL_IDS[tag]
         out = base / f"vibevoice-{tag}-mlx"
-        convert_model(model_id, tag, out)
+        convert_model(model_id, tag, out, hf_prefix=args.hf_prefix)
         if args.upload:
             upload(out, f"{args.hf_prefix}/vibevoice-{tag}-mlx")
 
