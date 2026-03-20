@@ -82,7 +82,7 @@ Optional CoreML semantic encoder (downloaded automatically when `--coreml-semant
 
 | Component | Size |
 |-----------|------|
-| [gafiatulin/vibevoice-semantic-encoder-mlpackage](https://huggingface.co/gafiatulin/vibevoice-semantic-encoder-mlpackage) | ~100 MB |
+| [gafiatulin/vibevoice-semantic-encoder-mlpackage](https://huggingface.co/gafiatulin/vibevoice-semantic-encoder-mlpackage) | ~657 MB |
 
 The semantic encoder provides acoustic feedback to the LLM during generation, improving speech quality. By default it runs as a pure MLX model on the GPU. The CoreML variant offloads it to the Apple Neural Engine, freeing the GPU for the LLM and diffusion head — this improves throughput without quality loss.
 
