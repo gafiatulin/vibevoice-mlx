@@ -163,7 +163,7 @@ tags:
   - voice-cloning
 ---
 
-# VibeVoice MLX — {tag.upper()}
+# VibeVoice {tag.upper()} — MLX
 
 MLX-converted fp16 weights for [{model_id}](https://huggingface.co/{model_id}).
 
