@@ -12,27 +12,27 @@ git clone https://github.com/gafiatulin/vibevoice-mlx && cd vibevoice-mlx
 uv sync
 
 # Basic synthesis (model downloads automatically)
-uv run python run/e2e_pipeline.py --text "Hello, world!" --output hello.wav
+vibevoice-mlx --text "Hello, world!" --output hello.wav
 
 # Voice cloning
-uv run python run/e2e_pipeline.py \
+vibevoice-mlx \
   --ref-audio speaker.wav --text "Clone this voice" --output cloned.wav
 
 # Encode a voice for reuse (one-time)
-uv run python run/e2e_pipeline.py \
+vibevoice-mlx \
   --ref-audio speaker.wav --save-voice voice.safetensors
 
 # Synthesize with saved voice
-uv run python run/e2e_pipeline.py \
+vibevoice-mlx \
   --voice voice.safetensors --text "Hello again!" --output hello.wav
 
 # Multi-speaker voice cloning
-uv run python run/e2e_pipeline.py \
+vibevoice-mlx \
   --ref-audio spk1.wav spk2.wav \
   --text "Speaker 1: Hello.\nSpeaker 2: Hi there." --output dialogue.wav
 
 # With quantization for faster generation
-uv run python run/e2e_pipeline.py --quantize 8 --text "Hello, world!"
+vibevoice-mlx --quantize 8 --text "Hello, world!"
 ```
 
 ## Performance
@@ -131,7 +131,7 @@ Text ──→ Qwen2.5 LLM backbone ──→ control tokens
 ## Project structure
 
 ```
-run/
+vibevoice_mlx/
 ├── e2e_pipeline.py     CLI entry point and voice cloning
 ├── model.py            Qwen2.5 backbone + diffusion head + VAE decoder
 ├── generate.py         Autoregressive generation with DPM-Solver++

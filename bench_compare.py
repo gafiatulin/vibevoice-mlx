@@ -3,9 +3,9 @@
 Each config runs in a subprocess for clean GPU state.
 
 Usage:
-    uv run python bench.py --model gafiatulin/vibevoice-1.5b-mlx
-    uv run python bench.py --model gafiatulin/vibevoice-1.5b-mlx --ref-audio speaker.wav
-    uv run python bench.py --model gafiatulin/vibevoice-7b-mlx --ref-audio speaker.wav --save-audio bench_outputs
+    uv run python bench_compare.py --model gafiatulin/vibevoice-1.5b-mlx
+    uv run python bench_compare.py --model gafiatulin/vibevoice-1.5b-mlx --ref-audio speaker.wav
+    uv run python bench_compare.py --model gafiatulin/vibevoice-7b-mlx --ref-audio speaker.wav --save-audio bench_outputs
 """
 
 import argparse
@@ -48,13 +48,12 @@ def make_script(model, voice_arg, text, seed, max_tokens, audio_out,
     voice_repr = repr(str(voice_arg)) if voice_arg else "None"
 
     return textwrap.dedent(f"""\
-import json, time, sys, os
+import json, time, os
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
-sys.path.insert(0, "run")
 import mlx.core as mx
-from load_weights import load_model
-from generate import generate, GenerationOptions
-from e2e_pipeline import (tokenize_text, VoiceCloneData, SAMPLE_RATE,
+from vibevoice_mlx.load_weights import load_model
+from vibevoice_mlx.generate import generate, GenerationOptions
+from vibevoice_mlx.e2e_pipeline import (tokenize_text, VoiceCloneData, SAMPLE_RATE,
                           _detect_tokenizer, load_voice, encode_voice_reference)
 
 model, config = load_model("{model}", quantize_bits={q})
@@ -64,7 +63,7 @@ semantic_fn = None
 semantic_reset = None
 
 if sem_mode == "coreml":
-    from e2e_pipeline import _try_coreml_semantic
+    from vibevoice_mlx.e2e_pipeline import _try_coreml_semantic
     r = _try_coreml_semantic(model, config)
     if r is not None:
         semantic_fn, semantic_reset = r
@@ -72,7 +71,7 @@ if sem_mode == "coreml":
         sem_mode = "mlx"
 
 if sem_mode == "mlx":
-    from e2e_pipeline import _try_mlx_semantic
+    from vibevoice_mlx.e2e_pipeline import _try_mlx_semantic
     r = _try_mlx_semantic(model, config, "{model}")
     if r is not None:
         semantic_fn, semantic_reset = r
@@ -177,11 +176,10 @@ def run_config(label, cfg, args, audio_dir=None):
 def pre_encode_voice(model_path, ref_audio, save_path):
     """Pre-encode voice in a subprocess, return path to saved embeddings."""
     script = textwrap.dedent(f"""\
-import sys, os
+import os
 os.environ["TRANSFORMERS_VERBOSITY"] = "error"
-sys.path.insert(0, "run")
-from load_weights import load_model
-from e2e_pipeline import encode_voice_reference, save_voice, SAMPLE_RATE, VOICE_CLONE_SAMPLES, SPEECH_TOK_COMPRESS_RATIO, _load_and_resample
+from vibevoice_mlx.load_weights import load_model
+from vibevoice_mlx.e2e_pipeline import encode_voice_reference, save_voice, SAMPLE_RATE, VOICE_CLONE_SAMPLES, SPEECH_TOK_COMPRESS_RATIO, _load_and_resample
 import math
 
 model, config = load_model("{model_path}", quantize_bits=None)
@@ -215,8 +213,7 @@ def main():
     args = parser.parse_args()
 
     # Pre-download model in parent process
-    sys.path.insert(0, "run")
-    from load_weights import resolve_model_path
+    from vibevoice_mlx.load_weights import resolve_model_path
     resolved = str(resolve_model_path(args.model))
     args.model = resolved
 

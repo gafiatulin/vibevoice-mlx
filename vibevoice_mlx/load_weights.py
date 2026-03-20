@@ -9,7 +9,7 @@ from typing import Optional
 import mlx.core as mx
 import mlx.nn as nn
 
-from model import VibeVoiceConfig, VibeVoiceModel
+from .model import VibeVoiceConfig, VibeVoiceModel
 
 
 def resolve_model_path(model_id_or_path: str) -> Path:

@@ -11,14 +11,11 @@ Usage:
 import argparse
 import json
 import shutil
-import sys
 from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent / "run"))
 
 import mlx.core as mx
 
-from load_weights import _load_safetensors, _map_hf_key, load_config, resolve_model_path
+from vibevoice_mlx.load_weights import _load_safetensors, _map_hf_key, load_config, resolve_model_path
 
 MODEL_IDS = {
     "1.5b": "microsoft/VibeVoice-1.5B",
@@ -176,10 +173,10 @@ git clone https://github.com/gafiatulin/vibevoice-mlx && cd vibevoice-mlx
 uv sync
 
 # Basic synthesis (weights download automatically)
-uv run python run/e2e_pipeline.py{model_arg} --text "Hello, world!" --output hello.wav
+vibevoice-mlx{model_arg} --text "Hello, world!" --output hello.wav
 
 # Voice cloning
-uv run python run/e2e_pipeline.py{model_arg} \\
+vibevoice-mlx{model_arg} \\
   --ref-audio speaker.wav --text "Clone this voice" --output cloned.wav
 ```
 """

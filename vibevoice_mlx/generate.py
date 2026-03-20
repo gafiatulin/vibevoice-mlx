@@ -11,9 +11,9 @@ import numpy as np
 import mlx.core as mx
 import mlx.nn as nn
 
-from model import KVCache, VibeVoiceConfig, VibeVoiceModel, compute_rope
-from streaming_vae import StreamingVAEDecoder
-from fast_forward import FastLM, FastDiffusionHead
+from .model import KVCache, VibeVoiceConfig, VibeVoiceModel, compute_rope
+from .streaming_vae import StreamingVAEDecoder
+from .fast_forward import FastLM, FastDiffusionHead
 
 
 # ---------------------------------------------------------------------------

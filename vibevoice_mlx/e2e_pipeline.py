@@ -1,20 +1,10 @@
 """VibeVoice MLX — end-to-end text-to-speech pipeline.
 
 Usage:
-    # Basic synthesis
-    uv run python run/e2e_pipeline.py --text "Hello, world!" --output hello.wav
-
-    # Voice cloning (single speaker)
-    uv run python run/e2e_pipeline.py \
-        --ref-audio speaker.wav --text "Clone this voice" --output cloned.wav
-
-    # Voice cloning (multi-speaker)
-    uv run python run/e2e_pipeline.py \
-        --ref-audio spk1.wav spk2.wav \
-        --text "Speaker 1: Hello\nSpeaker 2: Hi there"
-
-    # With INT8 quantization
-    uv run python run/e2e_pipeline.py --quantize 8 --text "Test"
+    vibevoice-mlx --text "Hello, world!" --output hello.wav
+    vibevoice-mlx --ref-audio speaker.wav --text "Clone this voice" --output cloned.wav
+    vibevoice-mlx --ref-audio spk1.wav spk2.wav --text "Speaker 1: Hello\nSpeaker 2: Hi there"
+    vibevoice-mlx --quantize 8 --text "Test"
 """
 
 from __future__ import annotations
@@ -23,7 +13,6 @@ import argparse
 import math
 import os
 import re
-import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -31,15 +20,12 @@ from typing import Optional
 
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 
-# Add run/ to path for imports
-sys.path.insert(0, str(Path(__file__).parent))
-
 import numpy as np
 
 import mlx.core as mx
 
-from generate import GenerationOptions, generate
-from load_weights import load_model, resolve_model_path
+from .generate import GenerationOptions, generate
+from .load_weights import load_model, resolve_model_path
 
 
 # ---------------------------------------------------------------------------
@@ -210,7 +196,7 @@ def _encode_voice_pytorch(
     Loads the VibeVoice model using its own package, bypassing AutoModel registration.
     """
     import torch
-    from load_weights import resolve_model_path
+    from .load_weights import resolve_model_path
     from safetensors.torch import load_file
 
     print("  Loading PyTorch VAE encoder...")
@@ -481,8 +467,8 @@ def _try_coreml_semantic(model, config):
 def _try_mlx_semantic(model, config, model_id):
     """Load pure MLX semantic encoder from HF weights."""
     try:
-        from semantic_encoder import load_semantic_encoder, FRAME_SAMPLES
-        from load_weights import resolve_model_path, _load_safetensors
+        from .semantic_encoder import load_semantic_encoder, FRAME_SAMPLES
+        from .load_weights import resolve_model_path, _load_safetensors
 
         print("Loading semantic encoder weights...")
         model_path = resolve_model_path(model_id)

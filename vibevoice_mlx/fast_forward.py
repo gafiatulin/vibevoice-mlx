@@ -15,7 +15,7 @@ import math
 import mlx.core as mx
 import mlx.nn as nn
 
-from model import VibeVoiceModel, VibeVoiceConfig, apply_rope
+from .model import VibeVoiceModel, VibeVoiceConfig, apply_rope
 
 
 # ---------------------------------------------------------------------------
