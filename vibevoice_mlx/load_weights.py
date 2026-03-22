@@ -228,45 +228,51 @@ def load_model(
     # Create model
     model = VibeVoiceModel(config)
 
-    # Separate manually-loaded component weights (not via nn.Module)
+    # Extract VAE decoder weights before discarding non-model weights
+    vae_keys = [k for k in raw_weights if k.startswith("vae_decoder.")]
+    vae_raw = {k: raw_weights[k] for k in vae_keys}
+    vae_data = _map_mlx_vae_weights(vae_raw) if vae_keys else {}
+    del vae_raw
+
+    # Separate model weights (drop acoustic_encoder/semantic_encoder/vae_decoder
+    # — these are loaded on-demand, not via nn.Module)
     manual_prefixes = ("vae_decoder.", "semantic_encoder.", "acoustic_encoder.")
-    non_vae = {k: v for k, v in raw_weights.items()
-               if not any(k.startswith(p) for p in manual_prefixes)}
+    model_weights = {k: v for k, v in raw_weights.items()
+                     if not any(k.startswith(p) for p in manual_prefixes)}
+    del raw_weights  # free the full safetensors dict early
 
     # Filter out lm_head.weight for tied-embedding models (1.5B)
-    # nn.Module.load_weights can't set attributes on None
     if config.tie_word_embeddings:
-        non_vae.pop("lm_head.weight", None)
+        model_weights.pop("lm_head.weight", None)
 
-    # Load non-VAE weights via nn.Module.load_weights
-    weight_pairs = list(non_vae.items())
+    # Load weights with optional quantization
+    weight_pairs = list(model_weights.items())
+    del model_weights
 
-    # Per-layer eval for LLM weights to control memory
     if quantize_bits is not None:
         print(f"  Loading with INT{quantize_bits} quantization (per-layer eval)...")
-        # Load weights layer by layer with eval to prevent memory explosion
         lm_layer_weights = {}
         other_weights = []
 
         for name, w in weight_pairs:
             if name.startswith("model.layers."):
-                parts = name.split(".")
-                layer_idx = int(parts[2])
+                layer_idx = int(name.split(".")[2])
                 if layer_idx not in lm_layer_weights:
                     lm_layer_weights[layer_idx] = []
                 lm_layer_weights[layer_idx].append((name, w))
             else:
                 other_weights.append((name, w))
+        del weight_pairs
 
-        # Load other weights first (strict=False since LLM layers are loaded separately)
         model.load_weights(other_weights, strict=False)
+        del other_weights
 
-        # Load LLM layers one at a time with eval
         for layer_idx in sorted(lm_layer_weights.keys()):
             model.load_weights(lm_layer_weights[layer_idx], strict=False)
             mx.eval(model.model.layers[layer_idx].parameters())
+            del lm_layer_weights[layer_idx]
+        del lm_layer_weights
 
-        # Quantize LLM backbone
         nn.quantize(
             model.model,
             bits=quantize_bits,
@@ -279,11 +285,7 @@ def load_model(
         )
     else:
         model.load_weights(weight_pairs)
-
-    # Load VAE decoder weights manually
-    vae_keys = [k for k in raw_weights if k.startswith("vae_decoder.")]
-    vae_raw = {k: raw_weights[k] for k in vae_keys}
-    vae_data = _map_mlx_vae_weights(vae_raw) if vae_keys else {}
+        del weight_pairs
     _populate_vae_decoder(model.vae_decoder, vae_data, config)
 
     # Cast all weights to float16 (HF checkpoints store bfloat16 which is
