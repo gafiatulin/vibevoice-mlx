@@ -193,8 +193,17 @@ def dpm_solver_sde_2m(
         return float(a), float(s)
 
     key = mx.random.key(seed)
-    key, subkey = mx.random.split(key)
-    sample = mx.random.normal(shape=(1, VAE_DIM), key=subkey).astype(mx.float32)
+    # Pre-generate all noise vectors upfront (avoids per-step random split overhead)
+    noise_keys = mx.random.split(key, num_steps + 1)
+    sample = mx.random.normal(shape=(1, VAE_DIM), key=noise_keys[0]).astype(mx.float32)
+    noise_vecs = mx.random.normal(shape=(num_steps, VAE_DIM), key=noise_keys[1])
+    mx.eval(sample, noise_vecs)
+
+    # Precompute schedule values (all in numpy, no per-step recomputation)
+    alphas = np.array([_sig_to_alpha_sigma(s)[0] for s in sigmas])
+    sigma_vals = np.array([_sig_to_alpha_sigma(s)[1] for s in sigmas])
+    lambdas = np.log(np.maximum(alphas, 1e-10)) - np.log(np.maximum(sigma_vals, 1e-10))
+    lambdas[-1] = np.inf  # sigma=0 at last position
 
     batched_cond = mx.concatenate([
         condition.astype(dtype), neg_condition.astype(dtype)
@@ -205,49 +214,32 @@ def dpm_solver_sde_2m(
     for i in range(num_steps):
         s_ts = int(timesteps[i])
 
-        # Denoise at current timestep
         x0 = _dpm_denoise_step(diff_head, sample, batched_cond, s_ts, cfg_scale, dtype)
         x0_list.append(x0)
 
-        # Sigma/alpha at current and next positions
-        alpha_s, sigma_s = _sig_to_alpha_sigma(sigmas[i])
-        alpha_t, sigma_t = _sig_to_alpha_sigma(sigmas[i + 1])
-
-        lam_s = np.log(max(alpha_s, 1e-10)) - np.log(max(sigma_s, 1e-10))
-        if sigma_t == 0.0:
-            lam_t = np.inf
-        else:
-            lam_t = np.log(max(alpha_t, 1e-10)) - np.log(max(sigma_t, 1e-10))
-        h = float(lam_t - lam_s)
-
+        h = float(lambdas[i + 1] - lambdas[i])
         is_last = (i == num_steps - 1)
-        # Diffusers: last step always first-order when final_sigmas_type="zero"
         use_first_order = len(x0_list) < 2 or is_last
 
         if use_first_order:
             D = x0_list[-1]
         else:
-            alpha_s1, sigma_s1 = _sig_to_alpha_sigma(sigmas[i - 1])
-            lam_s1 = np.log(max(alpha_s1, 1e-10)) - np.log(max(sigma_s1, 1e-10))
-            h_prev = float(lam_s - lam_s1)
+            h_prev = float(lambdas[i] - lambdas[i - 1])
             r = h_prev / h
-            D0 = x0_list[-1]
-            D1 = (1.0 / r) * (x0_list[-1] - x0_list[-2])
-            D = D0 + 0.5 * D1
+            D = x0_list[-1] + 0.5 / r * (x0_list[-1] - x0_list[-2])
 
         # SDE update
         if np.isinf(h):
-            # Last step with sigma_t=0: converge directly to x0 prediction
             sample = D
         else:
             exp_neg_h = float(np.exp(-h))
             exp_neg_2h = float(np.exp(-2.0 * h))
-            sample = (sigma_t / sigma_s * exp_neg_h) * sample + alpha_t * (1.0 - exp_neg_2h) * D
-
-            # Stochastic noise injection
-            key, subkey = mx.random.split(key)
-            noise = mx.random.normal(shape=(1, VAE_DIM), key=subkey).astype(mx.float32)
-            sample = sample + sigma_t * float(np.sqrt(max(0.0, 1.0 - exp_neg_2h))) * noise
+            s_t = float(sigma_vals[i + 1])
+            s_s = float(sigma_vals[i])
+            a_t = float(alphas[i + 1])
+            sample = (s_t / s_s * exp_neg_h) * sample + a_t * (1.0 - exp_neg_2h) * D
+            noise = noise_vecs[i:i + 1].astype(mx.float32)
+            sample = sample + s_t * float(np.sqrt(max(0.0, 1.0 - exp_neg_2h))) * noise
 
     return sample
 
@@ -298,17 +290,22 @@ def generate(
     use_evolving_cfg = opts.cfg_scale > 1.0
 
     # Initialize negative (unconditional) branch for CFG.
-    # Seed with speech_start token; the neg KV cache evolves alongside the
-    # main cache so the unconditional condition tracks the generation position.
-    neg_embed = embed_table[config.speech_start_id].reshape(1, 1, config.hidden_size)
-    neg_pos = mx.arange(1, dtype=mx.float32)
-    neg_cos, neg_sin = compute_rope(neg_pos, config.head_dim, config.rope_theta)
-    neg_k_cache = [mx.zeros((1, config.num_key_value_heads, 0, config.head_dim), dtype=dtype)] * NL
-    neg_v_cache = [mx.zeros((1, config.num_key_value_heads, 0, config.head_dim), dtype=dtype)] * NL
-    neg_hidden = fast_lm.forward(neg_embed, neg_cos, neg_sin, neg_k_cache, neg_v_cache)
-    mx.eval(neg_hidden, *neg_k_cache, *neg_v_cache)
-    neg_condition = neg_hidden[:, 0:1, :].reshape(1, config.hidden_size)
-    neg_position = 1
+    # Only allocate when CFG is active to save memory.
+    if use_evolving_cfg:
+        neg_embed = embed_table[config.speech_start_id].reshape(1, 1, config.hidden_size)
+        neg_pos = mx.arange(1, dtype=mx.float32)
+        neg_cos, neg_sin = compute_rope(neg_pos, config.head_dim, config.rope_theta)
+        neg_k_cache = [mx.zeros((1, config.num_key_value_heads, 0, config.head_dim), dtype=dtype)] * NL
+        neg_v_cache = [mx.zeros((1, config.num_key_value_heads, 0, config.head_dim), dtype=dtype)] * NL
+        neg_hidden = fast_lm.forward(neg_embed, neg_cos, neg_sin, neg_k_cache, neg_v_cache)
+        mx.eval(neg_hidden, *neg_k_cache, *neg_v_cache)
+        neg_condition = neg_hidden[:, 0:1, :].reshape(1, config.hidden_size)
+        neg_position = 1
+    else:
+        # Static zero condition for CFG=1.0 (no guidance)
+        neg_condition = mx.zeros((1, config.hidden_size), dtype=dtype)
+        neg_k_cache = neg_v_cache = None
+        neg_position = 0
 
     # Prefill (use fast_lm.prefill for batched tokens)
     t0 = time.perf_counter()

@@ -113,20 +113,24 @@ def encode_voice_reference(
     from .vae_encoder import load_vae_encoder_weights, encode_audio
     from .load_weights import resolve_model_path, _load_safetensors
 
-    model_path = resolve_model_path(model_id)
-    raw = _load_safetensors(model_path)
-
-    has_enc = (
-        any(k.startswith("model.acoustic_tokenizer.encoder.") for k in raw)
-        or any(k.startswith("acoustic_encoder.") for k in raw)
-    )
-    if not has_enc:
-        raise RuntimeError(
-            f"No acoustic encoder weights found in {model_path}. "
-            "Re-convert the model to include encoder weights."
+    # Cache encoder weights across calls (avoid reloading safetensors from disk)
+    cache_key = model_id
+    if not hasattr(encode_voice_reference, "_enc_cache"):
+        encode_voice_reference._enc_cache = {}
+    if cache_key not in encode_voice_reference._enc_cache:
+        model_path = resolve_model_path(model_id)
+        raw = _load_safetensors(model_path)
+        has_enc = (
+            any(k.startswith("model.acoustic_tokenizer.encoder.") for k in raw)
+            or any(k.startswith("acoustic_encoder.") for k in raw)
         )
-
-    enc_weights = load_vae_encoder_weights(raw)
+        if not has_enc:
+            raise RuntimeError(
+                f"No acoustic encoder weights found in {model_path}. "
+                "Re-convert the model to include encoder weights."
+            )
+        encode_voice_reference._enc_cache[cache_key] = load_vae_encoder_weights(raw)
+    enc_weights = encode_voice_reference._enc_cache[cache_key]
 
     # Pad/trim to VOICE_CLONE_SAMPLES
     audio_padded = np.zeros(VOICE_CLONE_SAMPLES, dtype=np.float32)
@@ -142,19 +146,14 @@ def encode_voice_reference(
     actual_t = min(latents.shape[1], num_vae_tokens)
     latents = latents[:, :actual_t, :]  # (1, T, vae_dim)
 
-    # Apply scaling and bias
+    # Apply scaling and bias, then batch through acoustic connector
     features = (latents + config.speech_bias_factor) * config.speech_scaling_factor
-
-    # Pass through acoustic connector frame by frame
-    embeds = []
-    for t in range(actual_t):
-        frame = features[:, t:t+1, :].astype(mx.float16)  # (1, 1, vae_dim)
-        emb = model.acoustic_connector(frame)
-        mx.eval(emb)
-        embeds.append(np.array(emb[0, 0]))
+    features = features.astype(mx.float16)  # (1, T, vae_dim)
+    embeds = model.acoustic_connector(features)  # (1, T, hidden_size)
+    mx.eval(embeds)
 
     print(f"  Encoded voice: {actual_t} tokens")
-    return np.stack(embeds)  # (T, hidden_size)
+    return np.array(embeds[0])  # (T, hidden_size)
 
 
 # ---------------------------------------------------------------------------
