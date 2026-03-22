@@ -48,6 +48,18 @@ def load_config(model_path: Path) -> VibeVoiceConfig:
                 return diff[k]
         return default
 
+    # Detect model variant: KugelAudio-family uses single-segment generation.
+    # Detection: explicit model_type/base_model, or speech_scaling_factor matching
+    # KugelAudio's value (0.1953125) rather than VibeVoice's (0.1962890625).
+    model_type = raw.get("model_type", "")
+    base_model = raw.get("base_model", "")
+    scaling = _get("speech_scaling_factor", default=None)
+    is_kugelaudio = (
+        "kugelaudio" in model_type
+        or "kugelaudio" in base_model
+        or (scaling is not None and abs(scaling - 0.1953125) < 1e-6)
+    )
+
     return VibeVoiceConfig(
         hidden_size=_get("hidden_size", default=1536),
         num_hidden_layers=_get("num_hidden_layers", default=28),
@@ -68,6 +80,7 @@ def load_config(model_path: Path) -> VibeVoiceConfig:
         speech_end_id=_get("speech_end_id", default=151653),
         speech_diffusion_id=_get("speech_diffusion_id", default=151654),
         eos_id=_get("eos_id", default=151643),
+        single_segment=_get("single_segment", default=is_kugelaudio),
     )
 
 

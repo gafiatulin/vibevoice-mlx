@@ -50,6 +50,8 @@ class VibeVoiceConfig:
     speech_end_id: int = 151653
     speech_diffusion_id: int = 151654
     eos_id: int = 151643
+    # Model variant behavior (auto-detected from config)
+    single_segment: bool = False  # True for KugelAudio-family models
 
 
 # ---------------------------------------------------------------------------

@@ -225,11 +225,15 @@ def tokenize_text(
         lines = text.strip().split("\n")
         speaker_tokens_list = []
         for line in lines:
+            line = line.strip()
             def _decrement_speaker(m):
                 n = int(m.group(1))
                 return f"Speaker {max(0, n - 1)}"
-            line_clean = re.sub(r"Speaker\s+(\d+)", _decrement_speaker, line.strip())
-            speaker_tokens_list += tokenizer.encode(f" {line_clean}\n", add_special_tokens=False)
+            if re.match(r"Speaker\s+\d+", line):
+                line = re.sub(r"Speaker\s+(\d+)", _decrement_speaker, line)
+            elif config.single_segment:
+                line = f"Speaker 0: {line}"
+            speaker_tokens_list += tokenizer.encode(f" {line}\n", add_special_tokens=False)
 
         output_section = tokenizer.encode(" Speech output:\n", add_special_tokens=False)
         all_ids = (system_tokens + voice_tokens + text_section +
@@ -243,7 +247,11 @@ def tokenize_text(
     lines = text.strip().split("\n")
     speaker_tokens = []
     for line in lines:
-        speaker_tokens += tokenizer.encode(f" {line.strip()}\n", add_special_tokens=False)
+        line = line.strip()
+        # Single-segment models require "Speaker 0:" prefix
+        if config.single_segment and not re.match(r"Speaker\s+\d+", line):
+            line = f"Speaker 0: {line}"
+        speaker_tokens += tokenizer.encode(f" {line}\n", add_special_tokens=False)
 
     output_section = tokenizer.encode(" Speech output:\n", add_special_tokens=False)
 
@@ -421,14 +429,16 @@ def main():
                         help="Quantization for LLM backbone (4=INT4, 8=INT8)")
     parser.add_argument("--quantize-diffusion", action="store_true",
                         help="Also INT8 quantize the diffusion head (faster, slight quality loss)")
-    parser.add_argument("--solver", type=str, default="dpm", choices=["dpm", "ddpm"],
-                        help="Diffusion solver")
+    parser.add_argument("--solver", type=str, default="dpm", choices=["dpm", "sde", "ddpm"],
+                        help="Diffusion solver (sde=stochastic DPM-Solver++, dpm=ODE DPM-Solver++)")
     parser.add_argument("--diffusion-steps", type=int, default=10,
                         help="Number of diffusion steps")
     parser.add_argument("--cfg-scale", type=float, default=1.3,
                         help="Classifier-free guidance scale")
     parser.add_argument("--max-speech-tokens", type=int, default=200,
                         help="Maximum speech tokens to generate")
+    parser.add_argument("--trim-silence", action="store_true",
+                        help="Trim trailing silence and repeated speech")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--no-semantic", action="store_true",
                         help="Skip semantic feedback (faster, lower quality)")
@@ -539,6 +549,7 @@ def main():
         diffusion_steps=args.diffusion_steps,
         cfg_scale=args.cfg_scale,
         max_speech_tokens=args.max_speech_tokens,
+        trim_silence=args.trim_silence,
         seed=args.seed,
     )
 

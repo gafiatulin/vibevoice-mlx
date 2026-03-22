@@ -36,10 +36,11 @@ _LAMBDA_NP = np.log(_ALPHA_NP / np.maximum(_SIGMA_NP, 1e-10))
 
 @dataclass
 class GenerationOptions:
-    solver: str = "dpm"            # "ddpm" or "dpm"
+    solver: str = "dpm"            # "ddpm", "dpm", or "sde"
     diffusion_steps: int = 10      # DPM-Solver++ steps
     cfg_scale: float = 1.3         # Classifier-free guidance
     max_speech_tokens: int = 200   # Safety limit
+    trim_silence: bool = False     # Trim trailing silence/repetition
     seed: int = 42
 
 
@@ -81,8 +82,24 @@ class GenerationMetrics:
 
 
 # ---------------------------------------------------------------------------
-# DPM-Solver++ 2M (all MLX, batched CFG)
+# DPM-Solver++ 2M — ODE and SDE variants (all MLX, batched CFG)
 # ---------------------------------------------------------------------------
+
+def _dpm_denoise_step(diff_head, sample, batched_cond, s, cfg_scale, dtype):
+    """Run diffusion head with batched CFG, return x0 prediction."""
+    batched_sample = mx.concatenate([sample, sample], axis=0).astype(dtype)
+    ts_mx = mx.array([float(s)]).astype(dtype)
+    v_batched = diff_head(batched_sample, ts_mx, batched_cond)
+    mx.eval(v_batched)
+
+    v_cond = v_batched[0:1].astype(mx.float32)
+    v_uncond = v_batched[1:2].astype(mx.float32)
+    v = v_uncond + cfg_scale * (v_cond - v_uncond)
+
+    alpha_s = float(_ALPHA_NP[s])
+    sigma_s = float(_SIGMA_NP[s])
+    return alpha_s * sample - sigma_s * v
+
 
 def dpm_solver_2m(
     diff_head,
@@ -93,7 +110,7 @@ def dpm_solver_2m(
     seed: int = 0,
     dtype=mx.float16,
 ) -> mx.array:
-    """DPM-Solver++ 2M entirely in MLX with batched CFG (B=2).
+    """ODE DPM-Solver++ 2M with batched CFG.
 
     Returns sample of shape (1, VAE_DIM) in float32.
     """
@@ -104,7 +121,7 @@ def dpm_solver_2m(
 
     batched_cond = mx.concatenate([
         condition.astype(dtype), neg_condition.astype(dtype)
-    ], axis=0)  # (2, H)
+    ], axis=0)
 
     x0_list = []
 
@@ -112,21 +129,10 @@ def dpm_solver_2m(
         s = int(t_schedule[i])
         t = int(t_schedule[i + 1])
 
-        batched_sample = mx.concatenate([sample, sample], axis=0).astype(dtype)
-        ts_mx = mx.array([float(s)]).astype(dtype)
-
-        v_batched = diff_head(batched_sample, ts_mx, batched_cond)
-        mx.eval(v_batched)
-
-        v_cond = v_batched[0:1].astype(mx.float32)
-        v_uncond = v_batched[1:2].astype(mx.float32)
-        v = v_uncond + cfg_scale * (v_cond - v_uncond)
-
-        alpha_s = float(_ALPHA_NP[s])
-        sigma_s = float(_SIGMA_NP[s])
-        x0 = alpha_s * sample - sigma_s * v
+        x0 = _dpm_denoise_step(diff_head, sample, batched_cond, s, cfg_scale, dtype)
         x0_list.append(x0)
 
+        sigma_s = float(_SIGMA_NP[s])
         lam_s = float(_LAMBDA_NP[s])
         lam_t = float(_LAMBDA_NP[max(t, 0)])
         h = lam_t - lam_s
@@ -144,13 +150,104 @@ def dpm_solver_2m(
             lam_s_prev = float(_LAMBDA_NP[s_prev])
             h_prev = lam_s - lam_s_prev
             r = h_prev / h
-            D0 = x0_list[-1]
-            D1 = (1.0 / r) * (x0_list[-1] - x0_list[-2])
-            D = D0 + 0.5 * D1
+            D = x0_list[-1] + 0.5 / r * (x0_list[-1] - x0_list[-2])
 
         sigma_t = float(_SIGMA_NP[t])
         alpha_t = float(_ALPHA_NP[t])
         sample = (sigma_t / sigma_s) * sample - alpha_t * float(np.expm1(-h)) * D
+
+    return sample
+
+
+def dpm_solver_sde_2m(
+    diff_head,
+    condition: mx.array,
+    neg_condition: mx.array,
+    cfg_scale: float,
+    num_steps: int = 20,
+    seed: int = 0,
+    dtype=mx.float16,
+) -> mx.array:
+    """SDE DPM-Solver++ 2M (stochastic, midpoint) with batched CFG.
+
+    Matches the sde-dpmsolver++ algorithm from HuggingFace Diffusers:
+    - final_sigmas_type="zero": last step targets sigma=0 (perfect denoising)
+    - lower_order_final: last step uses first-order update
+    - Noise injected at every step (coefficient=0 at last step due to sigma_t=0)
+
+    Returns sample of shape (1, VAE_DIM) in float32.
+    """
+    # Timestep schedule: N timesteps from 999→~50 (matching diffusers linspace)
+    timesteps = np.round(
+        np.linspace(0, DDPM_STEPS - 1, num_steps + 1)
+    ).astype(np.int64)[::-1][:-1]  # (num_steps,) from high to low
+
+    # Build sigmas array with final sigma=0 (diffusers final_sigmas_type="zero")
+    all_sigmas = ((1.0 - _AC64) / _AC64) ** 0.5  # ratio-form sigmas
+    sigmas = np.interp(timesteps, np.arange(len(all_sigmas)), all_sigmas)
+    sigmas = np.append(sigmas, 0.0)  # (num_steps + 1,) — last entry is 0
+
+    def _sig_to_alpha_sigma(sig):
+        a = 1.0 / np.sqrt(sig ** 2 + 1.0)
+        s = sig * a
+        return float(a), float(s)
+
+    key = mx.random.key(seed)
+    key, subkey = mx.random.split(key)
+    sample = mx.random.normal(shape=(1, VAE_DIM), key=subkey).astype(mx.float32)
+
+    batched_cond = mx.concatenate([
+        condition.astype(dtype), neg_condition.astype(dtype)
+    ], axis=0)
+
+    x0_list = []
+
+    for i in range(num_steps):
+        s_ts = int(timesteps[i])
+
+        # Denoise at current timestep
+        x0 = _dpm_denoise_step(diff_head, sample, batched_cond, s_ts, cfg_scale, dtype)
+        x0_list.append(x0)
+
+        # Sigma/alpha at current and next positions
+        alpha_s, sigma_s = _sig_to_alpha_sigma(sigmas[i])
+        alpha_t, sigma_t = _sig_to_alpha_sigma(sigmas[i + 1])
+
+        lam_s = np.log(max(alpha_s, 1e-10)) - np.log(max(sigma_s, 1e-10))
+        if sigma_t == 0.0:
+            lam_t = np.inf
+        else:
+            lam_t = np.log(max(alpha_t, 1e-10)) - np.log(max(sigma_t, 1e-10))
+        h = float(lam_t - lam_s)
+
+        is_last = (i == num_steps - 1)
+        # Diffusers: last step always first-order when final_sigmas_type="zero"
+        use_first_order = len(x0_list) < 2 or is_last
+
+        if use_first_order:
+            D = x0_list[-1]
+        else:
+            alpha_s1, sigma_s1 = _sig_to_alpha_sigma(sigmas[i - 1])
+            lam_s1 = np.log(max(alpha_s1, 1e-10)) - np.log(max(sigma_s1, 1e-10))
+            h_prev = float(lam_s - lam_s1)
+            r = h_prev / h
+            D0 = x0_list[-1]
+            D1 = (1.0 / r) * (x0_list[-1] - x0_list[-2])
+            D = D0 + 0.5 * D1
+
+        # SDE update
+        if np.isinf(h):
+            # Last step with sigma_t=0: converge directly to x0 prediction
+            sample = D
+        else:
+            exp_neg_h = float(np.exp(-h))
+            exp_neg_2h = float(np.exp(-2.0 * h))
+            sample = (sigma_t / sigma_s * exp_neg_h) * sample + alpha_t * (1.0 - exp_neg_2h) * D
+
+            # Stochastic noise injection
+            key, subkey = mx.random.split(key)
+            noise = mx.random.normal(shape=(1, VAE_DIM), key=subkey).astype(mx.float32)
+            sample = sample + sigma_t * float(np.sqrt(max(0.0, 1.0 - exp_neg_2h))) * noise
 
     return sample
 
@@ -198,19 +295,20 @@ def generate(
     embed_table = fast_lm.embed_w
     NL = config.num_hidden_layers
 
-    # Compute negative condition for CFG (speech_start token through LM, no cache)
-    neg_k = [None] * NL
-    neg_v = [None] * NL
+    use_evolving_cfg = opts.cfg_scale > 1.0
+
+    # Initialize negative (unconditional) branch for CFG.
+    # Seed with speech_start token; the neg KV cache evolves alongside the
+    # main cache so the unconditional condition tracks the generation position.
     neg_embed = embed_table[config.speech_start_id].reshape(1, 1, config.hidden_size)
     neg_pos = mx.arange(1, dtype=mx.float32)
     neg_cos, neg_sin = compute_rope(neg_pos, config.head_dim, config.rope_theta)
-    # Use fast_lm for neg condition (no mask needed for single token)
-    neg_k_tmp = [mx.zeros((1, config.num_key_value_heads, 0, config.head_dim), dtype=dtype)] * NL
-    neg_v_tmp = [mx.zeros((1, config.num_key_value_heads, 0, config.head_dim), dtype=dtype)] * NL
-    neg_hidden = fast_lm.forward(neg_embed, neg_cos, neg_sin, neg_k_tmp, neg_v_tmp)
-    mx.eval(neg_hidden)
+    neg_k_cache = [mx.zeros((1, config.num_key_value_heads, 0, config.head_dim), dtype=dtype)] * NL
+    neg_v_cache = [mx.zeros((1, config.num_key_value_heads, 0, config.head_dim), dtype=dtype)] * NL
+    neg_hidden = fast_lm.forward(neg_embed, neg_cos, neg_sin, neg_k_cache, neg_v_cache)
+    mx.eval(neg_hidden, *neg_k_cache, *neg_v_cache)
     neg_condition = neg_hidden[:, 0:1, :].reshape(1, config.hidden_size)
-    del neg_k_tmp, neg_v_tmp
+    neg_position = 1
 
     # Prefill (use fast_lm.prefill for batched tokens)
     t0 = time.perf_counter()
@@ -241,8 +339,23 @@ def generate(
     metrics.record("prefill", (time.perf_counter() - t0) * 1000)
     metrics.num_text_tokens = n_prefill
 
+    # Single-segment models (KugelAudio): constrain to speech-structural tokens
+    # only to prevent text token hallucination and looping.
+    # Multi-segment models (VibeVoice): allow all tokens for speaker turns.
+    if config.single_segment:
+        allowed_tokens = mx.array([
+            config.speech_start_id, config.speech_end_id,
+            config.speech_diffusion_id, config.eos_id,
+        ])
+        logit_mask = mx.full((1, 1, config.vocab_size), float("-inf"), dtype=dtype)
+        logit_mask[0, 0, allowed_tokens] = 0.0
+    else:
+        logit_mask = None
+
     # First token
     logits = fast_lm.logits(hidden)
+    if logit_mask is not None:
+        logits = logits + logit_mask
     mx.eval(logits)
     next_token = int(mx.argmax(logits[0, 0]).item())
 
@@ -256,8 +369,13 @@ def generate(
     rng = np.random.RandomState(opts.seed)
     position = n_prefill
 
+    # Single-segment models stop on speech_end; multi-segment only on eos
+    stop_tokens = {config.eos_id}
+    if config.single_segment:
+        stop_tokens.add(config.speech_end_id)
+
     for step in range(opts.max_speech_tokens * 3):
-        if next_token == config.eos_id:
+        if next_token in stop_tokens:
             break
         if metrics.num_speech_tokens >= opts.max_speech_tokens:
             break
@@ -268,7 +386,8 @@ def generate(
             # Diffusion (fast path — no nn.Module dispatch)
             t0 = time.perf_counter()
             condition = hidden[:, 0:1, :].reshape(1, config.hidden_size)
-            sample = dpm_solver_2m(
+            solver_fn = dpm_solver_sde_2m if opts.solver == "sde" else dpm_solver_2m
+            sample = solver_fn(
                 fast_diff, condition, neg_condition, opts.cfg_scale,
                 num_steps=opts.diffusion_steps,
                 seed=rng.randint(0, 2**31),
@@ -316,8 +435,20 @@ def generate(
         cos, sin = compute_rope(pos, config.head_dim, config.rope_theta)
         hidden = fast_lm.forward(next_embed, cos, sin, k_cache, v_cache)
         logits = fast_lm.logits(hidden)
+        if logit_mask is not None:
+            logits = logits + logit_mask
         mx.eval(logits)
         next_token = int(mx.argmax(logits[0, 0]).item())
+
+        # Evolving unconditional branch: feed same embedding, track neg_condition
+        if use_evolving_cfg:
+            neg_pos = mx.array([float(neg_position)], dtype=mx.float32)
+            neg_cos, neg_sin = compute_rope(neg_pos, config.head_dim, config.rope_theta)
+            neg_hidden = fast_lm.forward(next_embed, neg_cos, neg_sin, neg_k_cache, neg_v_cache)
+            mx.eval(neg_hidden, *neg_k_cache, *neg_v_cache)
+            neg_condition = neg_hidden[:, 0:1, :].reshape(1, config.hidden_size)
+            neg_position += 1
+
         metrics.record("lm_step", (time.perf_counter() - t0) * 1000)
         position += 1
 
@@ -328,6 +459,8 @@ def generate(
         full_audio = model.vae_decoder(full_latent)
         mx.eval(full_audio)
         audio_out = np.array(full_audio).squeeze().astype(np.float32)
+        if opts.trim_silence:
+            audio_out = _trim_trailing_silence(audio_out)
         metrics.record("vae_final", (time.perf_counter() - t0) * 1000)
     else:
         audio_out = np.zeros(0, dtype=np.float32)
@@ -336,3 +469,56 @@ def generate(
     metrics.audio_samples = len(audio_out)
 
     return audio_out, metrics
+
+
+def _trim_trailing_silence(audio: np.ndarray, sr: int = 24000,
+                           threshold: float = 0.05,
+                           long_silence_ms: int = 1500,
+                           pad_ms: int = 150) -> np.ndarray:
+    """Trim audio after speech ends.
+
+    Two-pass approach:
+    1. Forward scan: if a long silence gap (>= long_silence_ms) follows
+       speech, cut there — this catches model repetition after a pause.
+    2. Backward scan: trim trailing silence/noise from the end.
+    """
+    window = int(sr * 0.05)  # 50ms windows
+    pad = int(sr * pad_ms / 1000)
+    long_silent_windows = max(1, int(long_silence_ms / 50))
+
+    n_windows = len(audio) // window
+    if n_windows == 0:
+        return audio
+
+    rms = np.array([
+        np.sqrt(np.mean(audio[i * window:(i + 1) * window] ** 2))
+        for i in range(n_windows)
+    ])
+
+    # Forward: find first long silence gap after speech starts
+    found_speech = False
+    silent_count = 0
+    for i in range(n_windows):
+        if rms[i] >= threshold:
+            found_speech = True
+            silent_count = 0
+        elif found_speech:
+            silent_count += 1
+            if silent_count >= long_silent_windows:
+                cut = (i - silent_count + 1) * window + pad
+                audio = audio[:min(cut, len(audio))]
+                break
+
+    # Backward: trim trailing silence/noise
+    n_windows = len(audio) // window
+    if n_windows > 2:
+        rms = np.array([
+            np.sqrt(np.mean(audio[i * window:(i + 1) * window] ** 2))
+            for i in range(n_windows)
+        ])
+        for i in range(n_windows - 1, 2, -1):
+            if rms[i] >= threshold and rms[i - 1] >= threshold and rms[i - 2] >= threshold:
+                end = min((i + 1) * window + pad, len(audio))
+                return audio[:end]
+
+    return audio

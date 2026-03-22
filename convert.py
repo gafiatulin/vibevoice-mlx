@@ -1,4 +1,4 @@
-"""Convert VibeVoice HuggingFace weights to standalone MLX format.
+"""Convert VibeVoice-compatible HuggingFace weights to standalone MLX format.
 
 Produces HuggingFace-uploadable model repos with MLX safetensors.
 
@@ -6,6 +6,7 @@ Usage:
     uv run python convert.py --output-dir converted/
     uv run python convert.py --output-dir converted/ --models 1.5b
     uv run python convert.py --output-dir converted/ --upload --hf-prefix your-username
+    uv run python convert.py --model-id kugelaudio/kugelaudio-0-open --output-dir converted/kugelaudio-mlx
 """
 
 import argparse
@@ -31,8 +32,15 @@ TOKENIZER_IDS = {
 SHARD_SIZE = 5 * 1024 * 1024 * 1024
 
 
-def convert_model(model_id: str, tag: str, output_dir: Path, hf_prefix: str = "gafiatulin"):
-    """Convert a VibeVoice model to MLX format."""
+def _detect_tokenizer_id(config) -> str:
+    """Pick the right Qwen2.5 tokenizer based on vocab size."""
+    if config.vocab_size <= 151936:
+        return "Qwen/Qwen2.5-1.5B"
+    return "Qwen/Qwen2.5-7B"
+
+
+def convert_model(model_id: str, output_dir: Path, tokenizer_id: str | None = None):
+    """Convert a VibeVoice-compatible model to MLX format."""
     print(f"\n{'='*60}")
     print(f"Converting {model_id}")
     print(f"{'='*60}")
@@ -43,6 +51,15 @@ def convert_model(model_id: str, tag: str, output_dir: Path, hf_prefix: str = "g
     # Load original weights
     raw = _load_safetensors(model_path)
     print(f"  Loaded {len(raw)} weight tensors")
+
+    # Extract speech scaling/bias from weights (stored as scalar tensors in HF
+    # checkpoints but used as config values in the MLX pipeline)
+    for wname, attr in [
+        ("model.speech_scaling_factor", "speech_scaling_factor"),
+        ("model.speech_bias_factor", "speech_bias_factor"),
+    ]:
+        if wname in raw:
+            setattr(config, attr, raw[wname].item())
 
     # Remap keys
     mapped = {}
@@ -58,7 +75,7 @@ def convert_model(model_id: str, tag: str, output_dir: Path, hf_prefix: str = "g
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Save weights (potentially sharded for 7B)
+    # Save weights (potentially sharded for 7B+)
     total_bytes = sum(w.nbytes for w in mapped.values())
     if total_bytes > SHARD_SIZE:
         _save_sharded(output_dir, mapped)
@@ -68,6 +85,7 @@ def convert_model(model_id: str, tag: str, output_dir: Path, hf_prefix: str = "g
     # Save config
     config_dict = {
         "model_type": "vibevoice",
+        "base_model": model_id,
         "hidden_size": config.hidden_size,
         "num_hidden_layers": config.num_hidden_layers,
         "num_attention_heads": config.num_attention_heads,
@@ -92,10 +110,11 @@ def convert_model(model_id: str, tag: str, output_dir: Path, hf_prefix: str = "g
         json.dump(config_dict, f, indent=2)
 
     # Copy tokenizer
-    _copy_tokenizer(output_dir, TOKENIZER_IDS[tag])
+    tok_id = tokenizer_id or _detect_tokenizer_id(config)
+    _copy_tokenizer(output_dir, tok_id)
 
     # Model card
-    _write_model_card(output_dir, model_id, tag, hf_prefix)
+    _write_model_card(output_dir, model_id)
 
     total_mb = sum(f.stat().st_size for f in output_dir.glob("*")) / 1e6
     print(f"  Saved to {output_dir} ({total_mb:.0f} MB)")
@@ -147,38 +166,21 @@ def _copy_tokenizer(output_dir: Path, tokenizer_id: str):
     print(f"  Tokenizer saved from {tokenizer_id}")
 
 
-def _write_model_card(output_dir: Path, model_id: str, tag: str, hf_prefix: str):
-    model_arg = "" if tag == "1.5b" else f"\n  --model {hf_prefix}/vibevoice-{tag}-mlx "
+def _write_model_card(output_dir: Path, model_id: str):
     card = f"""---
 license: mit
 base_model: {model_id}
 tags:
   - mlx
   - tts
-  - vibevoice
   - apple-silicon
-  - voice-cloning
 ---
 
-# VibeVoice {tag.upper()} — MLX
+# {model_id} — MLX
 
 MLX-converted fp16 weights for [{model_id}](https://huggingface.co/{model_id}).
 
-For inference code, benchmarks, and documentation see [vibevoice-mlx](https://github.com/gafiatulin/vibevoice-mlx).
-
-## Quick start
-
-```bash
-git clone https://github.com/gafiatulin/vibevoice-mlx && cd vibevoice-mlx
-uv sync
-
-# Basic synthesis (weights download automatically)
-uv run vibevoice-mlx{model_arg} --text "Hello, world!" --output hello.wav
-
-# Voice cloning
-uv run vibevoice-mlx{model_arg} \\
-  --ref-audio speaker.wav --text "Clone this voice" --output cloned.wav
-```
+For inference code see [vibevoice-mlx](https://github.com/gafiatulin/vibevoice-mlx).
 """
     (output_dir / "README.md").write_text(card)
 
@@ -193,22 +195,36 @@ def upload(output_dir: Path, repo_id: str):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Convert VibeVoice weights to MLX format")
+    parser = argparse.ArgumentParser(description="Convert VibeVoice-compatible weights to MLX format")
     parser.add_argument("--output-dir", type=str, default="converted", help="Output directory")
-    parser.add_argument("--models", nargs="+", default=["1.5b", "7b"], choices=["1.5b", "7b"],
-                        help="Which models to convert")
+    parser.add_argument("--models", nargs="+", default=None, choices=["1.5b", "7b"],
+                        help="Built-in model tags to convert (1.5b, 7b)")
+    parser.add_argument("--model-id", type=str, default=None,
+                        help="Arbitrary HuggingFace model ID to convert")
+    parser.add_argument("--tokenizer", type=str, default=None,
+                        help="Tokenizer ID (auto-detected if not specified)")
     parser.add_argument("--upload", action="store_true", help="Upload to HuggingFace")
     parser.add_argument("--hf-prefix", type=str, default="gafiatulin", help="HF username/org prefix")
     args = parser.parse_args()
 
     base = Path(args.output_dir)
 
-    for tag in args.models:
-        model_id = MODEL_IDS[tag]
-        out = base / f"vibevoice-{tag}-mlx"
-        convert_model(model_id, tag, out, hf_prefix=args.hf_prefix)
+    if args.model_id:
+        # Convert arbitrary model
+        out = base if base.name != "converted" else base / (args.model_id.replace("/", "-") + "-mlx")
+        convert_model(args.model_id, out, tokenizer_id=args.tokenizer)
         if args.upload:
-            upload(out, f"{args.hf_prefix}/vibevoice-{tag}-mlx")
+            repo_id = f"{args.hf_prefix}/{out.name}"
+            upload(out, repo_id)
+    else:
+        # Convert built-in models
+        tags = args.models or ["1.5b", "7b"]
+        for tag in tags:
+            model_id = MODEL_IDS[tag]
+            out = base / f"vibevoice-{tag}-mlx"
+            convert_model(model_id, out, tokenizer_id=TOKENIZER_IDS[tag])
+            if args.upload:
+                upload(out, f"{args.hf_prefix}/vibevoice-{tag}-mlx")
 
     print("\nDone!")
 
