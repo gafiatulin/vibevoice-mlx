@@ -105,165 +105,55 @@ def encode_voice_reference(
     config,
     model_id: str,
 ) -> np.ndarray:
-    """Encode reference audio to speech embeddings.
+    """Encode reference audio to speech embeddings via pure MLX VAE encoder.
 
-    Tries CoreML (from gafiatulin/vibevoice-tts-*-coreml) first,
-    then PyTorch, then dummy fallback.
+    Uses the model's own acoustic tokenizer encoder weights directly.
     Returns embeddings of shape (num_vae_tokens, hidden_size).
     """
-    # Try CoreML path (compiled .mlmodelc from HF repo)
-    try:
-        return _encode_voice_coreml(wav, num_vae_tokens, model, config)
-    except Exception as e:
-        print(f"  CoreML voice encoding failed: {e}")
-
-    # Try PyTorch path
-    try:
-        return _encode_voice_pytorch(wav, num_vae_tokens, model, config, model_id)
-    except Exception as e:
-        print(f"  PyTorch voice encoding failed: {e}")
-
-    # Dummy fallback
-    print("  Warning: No VAE encoder available, voice cloning quality will be degraded")
-    return np.zeros((num_vae_tokens, config.hidden_size), dtype=np.float32)
-
-
-def _encode_voice_coreml(
-    wav: np.ndarray,
-    num_vae_tokens: int,
-    model,
-    config,
-) -> np.ndarray:
-    """Encode reference audio via CoreML VAE encoder + MLX acoustic connector.
-
-    Downloads compiled CoreML models from gafiatulin/vibevoice-tts-*-coreml.
-    """
-    import coremltools as ct
-    from huggingface_hub import snapshot_download
-
-    # Pick the right CoreML repo based on model size
-    if config.hidden_size <= 1536:
-        coreml_repo = "gafiatulin/vibevoice-tts-1.5b-coreml"
-    else:
-        coreml_repo = "gafiatulin/vibevoice-tts-7b-coreml"
-
-    coreml_path = Path(snapshot_download(
-        coreml_repo,
-        allow_patterns=["vae_encoder.mlmodelc/*"],
-    ))
-
-    vae_enc_path = coreml_path / "vae_encoder.mlmodelc"
-    if not vae_enc_path.exists():
-        raise FileNotFoundError(f"vae_encoder.mlmodelc not found in {coreml_path}")
-
-    # .mlmodelc needs CompiledMLModel (not MLModel which requires Manifest.json)
-    cml_vae_enc = ct.models.CompiledMLModel(str(vae_enc_path))
-
-    # VAE encoder expects fixed 10s = 240000 samples, shape (1, 1, 240000)
-    audio_input = np.zeros((1, 1, VOICE_CLONE_SAMPLES), dtype=np.float32)
-    actual_len = min(len(wav), VOICE_CLONE_SAMPLES)
-    audio_input[0, 0, :actual_len] = wav[:actual_len]
-
-    latents = cml_vae_enc.predict({"audio": audio_input})["latent"]
-    # latents shape: (1, vae_dim, T_full) — trim to actual token count
-    actual_t = min(latents.shape[2], num_vae_tokens)
-    latents = latents[:, :, :actual_t]  # (1, vae_dim, T)
-
-    # Apply scaling and bias
-    features = (latents + config.speech_bias_factor) * config.speech_scaling_factor
-
-    # Use MLX acoustic connector frame by frame
-    embeds = []
-    for t in range(actual_t):
-        frame = features[:, :, t:t+1].transpose(0, 2, 1)  # (1, 1, vae_dim)
-        frame_mx = mx.array(frame).astype(mx.float16)
-        emb = model.acoustic_connector(frame_mx)
-        mx.eval(emb)
-        embeds.append(np.array(emb[0, 0]))
-
-    return np.stack(embeds)  # (T, hidden_size)
-
-
-def _encode_voice_pytorch(
-    wav: np.ndarray,
-    num_vae_tokens: int,
-    model,
-    config,
-    model_id: str,
-) -> np.ndarray:
-    """Encode reference audio via PyTorch VAE encoder + MLX acoustic connector.
-
-    Loads the VibeVoice model using its own package, bypassing AutoModel registration.
-    """
-    import torch
-    from .load_weights import resolve_model_path
-    from safetensors.torch import load_file
-
-    print("  Loading PyTorch VAE encoder...")
-
-    # Import the VibeVoice acoustic tokenizer directly
-    from vibevoice.modular.modular_vibevoice_tokenizer import (
-        VibeVoiceAcousticTokenizerConfig,
-        VibeVoiceAcousticTokenizerModel,
-    )
+    from .vae_encoder import load_vae_encoder_weights, encode_audio
+    from .load_weights import resolve_model_path, _load_safetensors
 
     model_path = resolve_model_path(model_id)
+    raw = _load_safetensors(model_path)
 
-    # Load config for acoustic tokenizer
-    import json
-    with open(model_path / "config.json") as f:
-        raw_config = json.load(f)
-    at_config = VibeVoiceAcousticTokenizerConfig(**raw_config["acoustic_tokenizer_config"])
-    acoustic_tokenizer = VibeVoiceAcousticTokenizerModel(at_config)
+    has_enc = (
+        any(k.startswith("model.acoustic_tokenizer.encoder.") for k in raw)
+        or any(k.startswith("acoustic_encoder.") for k in raw)
+    )
+    if not has_enc:
+        raise RuntimeError(
+            f"No acoustic encoder weights found in {model_path}. "
+            "Re-convert the model to include encoder weights."
+        )
 
-    # Load encoder weights from safetensors
-    all_weights = {}
-    for sf_file in sorted(model_path.glob("*.safetensors")):
-        all_weights.update(load_file(str(sf_file)))
-
-    # Filter to acoustic tokenizer encoder weights only
-    enc_prefix = "model.acoustic_tokenizer.encoder."
-    enc_weights = {k[len("model.acoustic_tokenizer."):]: v
-                   for k, v in all_weights.items()
-                   if k.startswith(enc_prefix)}
-    # Also need the shared weights (norm, etc.)
-    for k, v in all_weights.items():
-        if k.startswith("model.acoustic_tokenizer.") and not k.startswith(enc_prefix.rstrip(".")):
-            short_k = k[len("model.acoustic_tokenizer."):]
-            if short_k not in enc_weights:
-                enc_weights[short_k] = v
-
-    acoustic_tokenizer.load_state_dict(enc_weights, strict=False)
-    acoustic_tokenizer.eval()
-
-    speech_bias = config.speech_bias_factor
-    speech_scale = config.speech_scaling_factor
+    enc_weights = load_vae_encoder_weights(raw)
 
     # Pad/trim to VOICE_CLONE_SAMPLES
     audio_padded = np.zeros(VOICE_CLONE_SAMPLES, dtype=np.float32)
     actual_len = min(len(wav), VOICE_CLONE_SAMPLES)
     audio_padded[:actual_len] = wav[:actual_len]
 
-    audio_tensor = torch.tensor(audio_padded, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
-    with torch.no_grad():
-        encoder_output = acoustic_tokenizer.encode(audio_tensor)
-        latents = encoder_output.sample(dist_type=acoustic_tokenizer.std_dist_type)[0]
-        actual_t = min(latents.shape[1], num_vae_tokens)
-        latents = latents[:, :actual_t, :]
-        features = (latents + speech_bias) * speech_scale
+    # Encode: (1, 1, T) → (1, T_compressed, vae_dim)
+    audio_mx = mx.array(audio_padded).reshape(1, 1, -1)
+    latents = encode_audio(audio_mx, enc_weights)
+    mx.eval(latents)
 
-    # Free PyTorch model
-    del acoustic_tokenizer, all_weights, enc_weights
+    # Trim to actual token count
+    actual_t = min(latents.shape[1], num_vae_tokens)
+    latents = latents[:, :actual_t, :]  # (1, T, vae_dim)
 
-    # Use MLX acoustic connector
-    features_np = features[0].numpy()  # (T, vae_dim)
+    # Apply scaling and bias
+    features = (latents + config.speech_bias_factor) * config.speech_scaling_factor
+
+    # Pass through acoustic connector frame by frame
     embeds = []
     for t in range(actual_t):
-        frame = mx.array(features_np[t:t+1]).reshape(1, 1, config.vae_dim).astype(mx.float16)
+        frame = features[:, t:t+1, :].astype(mx.float16)  # (1, 1, vae_dim)
         emb = model.acoustic_connector(frame)
         mx.eval(emb)
         embeds.append(np.array(emb[0, 0]))
 
+    print(f"  Encoded voice: {actual_t} tokens")
     return np.stack(embeds)  # (T, hidden_size)
 
 

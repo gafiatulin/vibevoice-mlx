@@ -92,6 +92,7 @@ _PREFIX_MAP = [
     ("model.acoustic_connector.", "acoustic_connector."),
     ("model.semantic_connector.", "semantic_connector."),
     ("model.semantic_tokenizer.encoder.", "semantic_encoder."),
+    ("model.acoustic_tokenizer.encoder.", "acoustic_encoder."),
 ]
 
 
@@ -101,11 +102,7 @@ def _map_hf_key(name: str) -> str | None:
     if name == "lm_head.weight":
         return "lm_head.weight"
 
-    # Skip weights we don't need
-    if "acoustic_tokenizer.encoder" in name:
-        return None
-    # Skip non-encoder semantic_tokenizer weights (e.g. decoder parts)
-    # but keep semantic_tokenizer.encoder.* for the MLX semantic encoder
+    # Skip tokenizer decoder weights (not used at inference)
     if "semantic_tokenizer" in name and "semantic_tokenizer.encoder." not in name:
         return None
     if name in ("model.speech_scaling_factor", "model.speech_bias_factor"):
@@ -196,6 +193,14 @@ def load_model(
 
     if is_hf_format:
         print("  Detected original HuggingFace format, remapping keys...")
+        # Extract speech scaling/bias from weights before remapping (they are
+        # stored as scalar tensors in HF checkpoints but used as config values)
+        for wname, attr in [
+            ("model.speech_scaling_factor", "speech_scaling_factor"),
+            ("model.speech_bias_factor", "speech_bias_factor"),
+        ]:
+            if wname in raw_weights:
+                setattr(config, attr, raw_weights[wname].item())
         mapped = {}
         for name, w in raw_weights.items():
             mlx_name = _map_hf_key(name)
@@ -210,11 +215,10 @@ def load_model(
     # Create model
     model = VibeVoiceModel(config)
 
-    # Separate VAE decoder and semantic encoder weights (loaded manually, not via nn.Module)
-    vae_keys = [k for k in raw_weights if k.startswith("vae_decoder.")]
-    sem_keys = [k for k in raw_weights if k.startswith("semantic_encoder.")]
+    # Separate manually-loaded component weights (not via nn.Module)
+    manual_prefixes = ("vae_decoder.", "semantic_encoder.", "acoustic_encoder.")
     non_vae = {k: v for k, v in raw_weights.items()
-               if not k.startswith("vae_decoder.") and not k.startswith("semantic_encoder.")}
+               if not any(k.startswith(p) for p in manual_prefixes)}
 
     # Filter out lm_head.weight for tied-embedding models (1.5B)
     # nn.Module.load_weights can't set attributes on None
@@ -264,6 +268,7 @@ def load_model(
         model.load_weights(weight_pairs)
 
     # Load VAE decoder weights manually
+    vae_keys = [k for k in raw_weights if k.startswith("vae_decoder.")]
     vae_raw = {k: raw_weights[k] for k in vae_keys}
     vae_data = _map_mlx_vae_weights(vae_raw) if vae_keys else {}
     _populate_vae_decoder(model.vae_decoder, vae_data, config)
