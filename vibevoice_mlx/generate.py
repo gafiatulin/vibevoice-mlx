@@ -86,11 +86,14 @@ class GenerationMetrics:
 # ---------------------------------------------------------------------------
 
 def _dpm_denoise_step(diff_head, sample, batched_cond, s, cfg_scale, dtype):
-    """Run diffusion head with batched CFG, return x0 prediction."""
+    """Run diffusion head with batched CFG, return x0 prediction.
+
+    No mx.eval — relies on MLX lazy evaluation to batch the entire
+    diffusion solve into fewer GPU submissions.
+    """
     batched_sample = mx.concatenate([sample, sample], axis=0).astype(dtype)
     ts_mx = mx.array([float(s)]).astype(dtype)
     v_batched = diff_head(batched_sample, ts_mx, batched_cond)
-    mx.eval(v_batched)
 
     v_cond = v_batched[0:1].astype(mx.float32)
     v_uncond = v_batched[1:2].astype(mx.float32)
@@ -420,26 +423,34 @@ def generate(
                     next_embed = acoustic_embed + sem_embed.reshape(1, 1, config.hidden_size)
             else:
                 next_embed = acoustic_embed
-            mx.eval(next_embed)
             metrics.record("connector", (time.perf_counter() - t0) * 1000)
         else:
             if next_token == config.speech_end_id and semantic_reset_fn is not None:
                 semantic_reset_fn()
             next_embed = embed_table[next_token].reshape(1, 1, config.hidden_size)
 
-        # LM step (fast path — raw quantized matmul)
+        # LM step (+ neg branch if evolving CFG)
         t0 = time.perf_counter()
         pos = mx.array([float(position)], dtype=mx.float32)
         cos, sin = compute_rope(pos, config.head_dim, config.rope_theta)
-        hidden = fast_lm.forward(next_embed, cos, sin, k_cache, v_cache)
+
+        if use_evolving_cfg:
+            # Batched: read weights once for both main+neg passes
+            neg_pos = mx.array([float(neg_position)], dtype=mx.float32)
+            neg_cos, neg_sin = compute_rope(neg_pos, config.head_dim, config.rope_theta)
+            hidden, neg_hidden = fast_lm.forward_dual(
+                next_embed, cos, sin, k_cache, v_cache,
+                next_embed, neg_cos, neg_sin, neg_k_cache, neg_v_cache,
+            )
+            neg_condition = neg_hidden[:, 0:1, :].reshape(1, config.hidden_size)
+            neg_position += 1
+        else:
+            hidden = fast_lm.forward(next_embed, cos, sin, k_cache, v_cache)
+
         logits = fast_lm.logits(hidden)
         if logit_mask is not None:
             logits = logits + logit_mask
-        # Silence-aware stop: when consecutive low-energy latents are
-        # detected, boost speech_end/eos logits. This catches models that
-        # lost end-of-speech signaling during fine-tuning.
-        # Latent RMS: speech >2.0, silence <1.0. Requires 3+ consecutive
-        # silent tokens to avoid triggering on natural pauses.
+        # Silence-aware stop: boost speech_end when generating silence
         if opts.silence_detection and config.single_segment and all_latents:
             lat_rms = float(mx.sqrt(mx.mean(all_latents[-1] ** 2)))
             if lat_rms < 1.0:
@@ -452,16 +463,6 @@ def generate(
                 logits[0, 0, config.eos_id] += boost
         mx.eval(logits)
         next_token = int(mx.argmax(logits[0, 0]).item())
-
-        # Evolving unconditional branch: feed same embedding, track neg_condition
-        if use_evolving_cfg:
-            neg_pos = mx.array([float(neg_position)], dtype=mx.float32)
-            neg_cos, neg_sin = compute_rope(neg_pos, config.head_dim, config.rope_theta)
-            neg_hidden = fast_lm.forward(next_embed, neg_cos, neg_sin, neg_k_cache, neg_v_cache)
-            mx.eval(neg_hidden, *neg_k_cache, *neg_v_cache)
-            neg_condition = neg_hidden[:, 0:1, :].reshape(1, config.hidden_size)
-            neg_position += 1
-
         metrics.record("lm_step", (time.perf_counter() - t0) * 1000)
         position += 1
 

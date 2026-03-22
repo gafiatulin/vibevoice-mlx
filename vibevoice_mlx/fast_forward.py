@@ -97,6 +97,81 @@ class FastLM:
         k_cache, v_cache: lists of (1, NKV, S, HD) arrays
         Returns: hidden (1, Q, H), updates k_cache/v_cache in place.
         """
+        return self._forward_inner(h, cos, sin, k_cache, v_cache)
+
+    def forward_dual(self, h_main, cos_main, sin_main, k_cache, v_cache,
+                     h_neg, cos_neg, sin_neg, neg_k_cache, neg_v_cache):
+        """Batched main+neg LM forward — reads weights once for both.
+
+        Returns: (hidden_main, hidden_neg), updates both KV caches.
+        """
+        NH, NKV, HD, H = self.NH, self.NKV, self.HD, self.H
+        scale = self.scale
+        eps = self.eps
+
+        hm, hn_input = h_main, h_neg
+
+        for li, d in enumerate(self.layers):
+            # Batch projections: concat (1,1,H) inputs → (2,1,H), single matmul
+            h_cat = mx.concatenate([hm, hn_input], axis=0)  # (2, 1, H)
+            res_cat = h_cat
+
+            hn_cat = mx.fast.rms_norm(h_cat, d["iln"], eps)
+
+            q_cat = _mm(hn_cat, d["q"])
+            if "bias" in d["q"]:
+                q_cat = q_cat + d["q"]["bias"]
+            k_cat = _mm(hn_cat, d["k"])
+            if "bias" in d["k"]:
+                k_cat = k_cat + d["k"]["bias"]
+            v_cat = _mm(hn_cat, d["v"])
+            if "bias" in d["v"]:
+                v_cat = v_cat + d["v"]["bias"]
+
+            # Split for attention (different KV caches)
+            q_m, q_n = q_cat[0:1], q_cat[1:2]
+            k_m, k_n = k_cat[0:1], k_cat[1:2]
+            v_m, v_n = v_cat[0:1], v_cat[1:2]
+
+            # Main attention
+            q_m = q_m.reshape(1, -1, NH, HD).transpose(0, 2, 1, 3)
+            k_m = k_m.reshape(1, -1, NKV, HD).transpose(0, 2, 1, 3)
+            v_m = v_m.reshape(1, -1, NKV, HD).transpose(0, 2, 1, 3)
+            q_m = apply_rope(q_m, cos_main, sin_main)
+            k_m = apply_rope(k_m, cos_main, sin_main)
+            k_cache[li] = mx.concatenate([k_cache[li], k_m], axis=2)
+            v_cache[li] = mx.concatenate([v_cache[li], v_m], axis=2)
+            out_m = mx.fast.scaled_dot_product_attention(
+                q_m, k_cache[li], v_cache[li], scale=scale,
+            ).transpose(0, 2, 1, 3).reshape(1, -1, H)
+
+            # Neg attention
+            q_n = q_n.reshape(1, -1, NH, HD).transpose(0, 2, 1, 3)
+            k_n = k_n.reshape(1, -1, NKV, HD).transpose(0, 2, 1, 3)
+            v_n = v_n.reshape(1, -1, NKV, HD).transpose(0, 2, 1, 3)
+            q_n = apply_rope(q_n, cos_neg, sin_neg)
+            k_n = apply_rope(k_n, cos_neg, sin_neg)
+            neg_k_cache[li] = mx.concatenate([neg_k_cache[li], k_n], axis=2)
+            neg_v_cache[li] = mx.concatenate([neg_v_cache[li], v_n], axis=2)
+            out_n = mx.fast.scaled_dot_product_attention(
+                q_n, neg_k_cache[li], neg_v_cache[li], scale=scale,
+            ).transpose(0, 2, 1, 3).reshape(1, -1, H)
+
+            # Batch o_proj + MLP
+            out_cat = mx.concatenate([out_m, out_n], axis=0)
+            h_cat = res_cat + _mm(out_cat, d["o"])
+
+            res_cat = h_cat
+            hn_cat = mx.fast.rms_norm(h_cat, d["pln"], eps)
+            h_cat = res_cat + _mm(nn.silu(_mm(hn_cat, d["g"])) * _mm(hn_cat, d["u"]), d["d"])
+
+            hm, hn_input = h_cat[0:1], h_cat[1:2]
+
+        hm = mx.fast.rms_norm(hm, self.norm_w, eps)
+        hn_input = mx.fast.rms_norm(hn_input, self.norm_w, eps)
+        return hm, hn_input
+
+    def _forward_inner(self, h, cos, sin, k_cache, v_cache):
         NH, NKV, HD, H = self.NH, self.NKV, self.HD, self.H
         scale = self.scale
         eps = self.eps
