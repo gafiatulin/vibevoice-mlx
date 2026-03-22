@@ -40,7 +40,7 @@ class GenerationOptions:
     diffusion_steps: int = 10      # DPM-Solver++ steps
     cfg_scale: float = 1.3         # Classifier-free guidance
     max_speech_tokens: int = 200   # Safety limit
-    trim_silence: bool = False     # Trim trailing silence/repetition
+    silence_detection: bool = False  # Stop on sustained silence + trim trailing
     seed: int = 42
 
 
@@ -366,6 +366,7 @@ def generate(
     # Autoregressive generation
     audio_chunks = []
     all_latents = []
+    silent_run = 0
     rng = np.random.RandomState(opts.seed)
     position = n_prefill
 
@@ -437,6 +438,21 @@ def generate(
         logits = fast_lm.logits(hidden)
         if logit_mask is not None:
             logits = logits + logit_mask
+        # Silence-aware stop: when consecutive low-energy latents are
+        # detected, boost speech_end/eos logits. This catches models that
+        # lost end-of-speech signaling during fine-tuning.
+        # Latent RMS: speech >2.0, silence <1.0. Requires 3+ consecutive
+        # silent tokens to avoid triggering on natural pauses.
+        if opts.silence_detection and config.single_segment and all_latents:
+            lat_rms = float(mx.sqrt(mx.mean(all_latents[-1] ** 2)))
+            if lat_rms < 1.0:
+                silent_run += 1
+            else:
+                silent_run = 0
+            if silent_run >= 3:
+                boost = min((silent_run - 2) * 5.0, 20.0)
+                logits[0, 0, config.speech_end_id] += boost
+                logits[0, 0, config.eos_id] += boost
         mx.eval(logits)
         next_token = int(mx.argmax(logits[0, 0]).item())
 
@@ -459,7 +475,7 @@ def generate(
         full_audio = model.vae_decoder(full_latent)
         mx.eval(full_audio)
         audio_out = np.array(full_audio).squeeze().astype(np.float32)
-        if opts.trim_silence:
+        if opts.silence_detection:
             audio_out = _trim_trailing_silence(audio_out)
         metrics.record("vae_final", (time.perf_counter() - t0) * 1000)
     else:

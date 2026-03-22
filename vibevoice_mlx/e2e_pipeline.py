@@ -437,8 +437,8 @@ def main():
                         help="Classifier-free guidance scale")
     parser.add_argument("--max-speech-tokens", type=int, default=200,
                         help="Maximum speech tokens to generate")
-    parser.add_argument("--trim-silence", action="store_true",
-                        help="Trim trailing silence and repeated speech")
+    parser.add_argument("--silence-detection", action="store_true",
+                        help="Detect end of speech via latent energy (for models that don't stop naturally)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--no-semantic", action="store_true",
                         help="Skip semantic feedback (faster, lower quality)")
@@ -549,7 +549,7 @@ def main():
         diffusion_steps=args.diffusion_steps,
         cfg_scale=args.cfg_scale,
         max_speech_tokens=args.max_speech_tokens,
-        trim_silence=args.trim_silence,
+        silence_detection=args.silence_detection,
         seed=args.seed,
     )
 
