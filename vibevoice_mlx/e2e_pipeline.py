@@ -174,11 +174,17 @@ def tokenize_text(
     config,
     ref_audio: list[str] | None = None,
     tokenizer=None,
+    speaker_embeds: list[tuple[int, np.ndarray]] | None = None,
 ) -> list[int] | VoiceCloneData:
     """Build the full prompt token sequence for TTS.
 
-    If ref_audio is provided, returns VoiceCloneData with per-speaker
-    embedding positions for voice cloning injection during prefill.
+    If ref_audio or speaker_embeds is provided, returns VoiceCloneData with
+    per-speaker embedding positions for voice cloning injection during prefill.
+
+    Args:
+        speaker_embeds: Pre-encoded embeddings as list of (num_tokens, embeds)
+            where embeds is shape (num_tokens, hidden_size). Alternative to
+            ref_audio for batch synthesis with pre-encoded voices.
     """
     if tokenizer is None:
         from transformers import AutoTokenizer
@@ -187,7 +193,28 @@ def tokenize_text(
     system_prompt = " Transform the text provided by various speakers into speech output, utilizing the distinct voice of each respective speaker.\n"
     system_tokens = tokenizer.encode(system_prompt)
 
-    if ref_audio is not None and len(ref_audio) > 0:
+    # Build voice references from either file paths or pre-encoded embeddings
+    voice_refs = None
+    if speaker_embeds is not None and len(speaker_embeds) > 0:
+        voice_refs = []
+        for num_tokens, embeds in speaker_embeds:
+            voice_refs.append((num_tokens, np.zeros(0, dtype=np.float32), embeds))
+    elif ref_audio is not None and len(ref_audio) > 0:
+        voice_refs = []
+        for audio_path in ref_audio:
+            if audio_path.endswith(".safetensors"):
+                embeds = load_voice(audio_path)
+                num_vae_tokens = embeds.shape[0]
+                wav = np.zeros(0, dtype=np.float32)
+            else:
+                wav = _load_and_resample(audio_path)
+                if len(wav) > VOICE_CLONE_SAMPLES:
+                    wav = wav[:VOICE_CLONE_SAMPLES]
+                num_vae_tokens = math.ceil(len(wav) / SPEECH_TOK_COMPRESS_RATIO)
+                embeds = None
+            voice_refs.append((num_vae_tokens, wav, embeds))
+
+    if voice_refs is not None:
         voice_prefix = tokenizer.encode(" Voice input:\n", add_special_tokens=False)
         newline_tok = tokenizer.encode("\n", add_special_tokens=False)
 
@@ -195,18 +222,7 @@ def tokenize_text(
         speakers = []
         current_offset = len(system_tokens) + len(voice_prefix)
 
-        for spk_idx, audio_path in enumerate(ref_audio):
-            # Pre-encoded voice: derive token count from embeddings
-            if audio_path.endswith(".safetensors"):
-                embeds = load_voice(audio_path)
-                num_vae_tokens = embeds.shape[0]
-                wav = np.zeros(0, dtype=np.float32)  # placeholder
-            else:
-                wav = _load_and_resample(audio_path)
-                if len(wav) > VOICE_CLONE_SAMPLES:
-                    wav = wav[:VOICE_CLONE_SAMPLES]
-                num_vae_tokens = math.ceil(len(wav) / SPEECH_TOK_COMPRESS_RATIO)
-
+        for spk_idx, (num_vae_tokens, wav, cached) in enumerate(voice_refs):
             spk_prefix = tokenizer.encode(f" Speaker {spk_idx}:", add_special_tokens=False)
             voice_tokens += spk_prefix
             current_offset += len(spk_prefix)
@@ -227,6 +243,7 @@ def tokenize_text(
                 ref_audio_np=wav,
                 num_vae_tokens=num_vae_tokens,
                 speech_embed_positions=speech_positions,
+                cached_embeds=cached,
             ))
 
         # Text section — normalize speaker IDs from 1-based (user) to 0-based (model)
@@ -514,25 +531,28 @@ def main():
         # Encode voice references
         voice_embeds = {}
         for spk in result.speakers:
-            voice_path = voice_files[spk.speaker_id] if voice_files else None
-            is_preencoded = voice_path and voice_path.endswith(".safetensors")
-
-            if is_preencoded:
-                print(f"  Loading pre-encoded voice for speaker {spk.speaker_id}...")
-                spk.cached_embeds = load_voice(voice_path)[:spk.num_vae_tokens]
+            if spk.cached_embeds is not None:
+                pass  # already have embeddings (e.g. from speaker_embeds)
             else:
-                print(f"  Encoding speaker {spk.speaker_id} ({spk.num_vae_tokens} tokens, "
-                      f"{len(spk.ref_audio_np)/SAMPLE_RATE:.1f}s audio)...")
-                spk.cached_embeds = encode_voice_reference(
-                    spk.ref_audio_np, spk.num_vae_tokens, model, config, args.model)
+                voice_path = voice_files[spk.speaker_id] if voice_files else None
+                is_preencoded = voice_path and voice_path.endswith(".safetensors")
 
-                # Save if requested
-                if args.save_voice:
-                    save_path = args.save_voice
-                    if len(result.speakers) > 1:
-                        base, ext = os.path.splitext(save_path)
-                        save_path = f"{base}_spk{spk.speaker_id}{ext}"
-                    save_voice(save_path, spk.cached_embeds)
+                if is_preencoded:
+                    print(f"  Loading pre-encoded voice for speaker {spk.speaker_id}...")
+                    spk.cached_embeds = load_voice(voice_path)[:spk.num_vae_tokens]
+                else:
+                    print(f"  Encoding speaker {spk.speaker_id} ({spk.num_vae_tokens} tokens, "
+                          f"{len(spk.ref_audio_np)/SAMPLE_RATE:.1f}s audio)...")
+                    spk.cached_embeds = encode_voice_reference(
+                        spk.ref_audio_np, spk.num_vae_tokens, model, config, args.model)
+
+                    # Save if requested
+                    if args.save_voice:
+                        save_path = args.save_voice
+                        if len(result.speakers) > 1:
+                            base, ext = os.path.splitext(save_path)
+                            save_path = f"{base}_spk{spk.speaker_id}{ext}"
+                        save_voice(save_path, spk.cached_embeds)
 
             # Map position -> embedding
             embeds_mx = mx.array(spk.cached_embeds).astype(mx.float16)
