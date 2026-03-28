@@ -69,17 +69,21 @@ def convert_model(model_id: str, output_dir: Path, tokenizer_id: str | None = No
         if wname in raw:
             setattr(config, attr, raw[wname].item())
 
-    # Remap keys
-    mapped = {}
-    skipped = []
-    for name, w in raw.items():
-        mlx_name = _map_hf_key(name)
-        if mlx_name is not None:
-            mapped[mlx_name] = w
-        else:
-            skipped.append(name)
-
-    print(f"  Mapped {len(mapped)} weights, skipped {len(skipped)}")
+    # Remap keys (skip if already in MLX format)
+    is_mlx_format = any(k.startswith("model.layers.") for k in raw)
+    if is_mlx_format:
+        mapped = raw
+        print(f"  Already MLX format, {len(mapped)} weights")
+    else:
+        mapped = {}
+        skipped = []
+        for name, w in raw.items():
+            mlx_name = _map_hf_key(name)
+            if mlx_name is not None:
+                mapped[mlx_name] = w
+            else:
+                skipped.append(name)
+        print(f"  Mapped {len(mapped)} weights, skipped {len(skipped)}")
 
     # Quantize if requested: load into model, quantize, then flatten back
     quantization_meta = None
