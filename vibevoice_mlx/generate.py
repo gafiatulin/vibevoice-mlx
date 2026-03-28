@@ -285,8 +285,12 @@ def generate(
     t0_total = time.perf_counter()
 
     # Build fast-path LM and diffusion head (raw matmul, no nn.Module dispatch)
-    fast_lm = FastLM(model, config)
-    fast_diff = FastDiffusionHead(model, config)
+    # Cache on model to avoid re-extracting weight references each call.
+    if not hasattr(model, "_fast_lm"):
+        model._fast_lm = FastLM(model, config)
+        model._fast_diff = FastDiffusionHead(model, config)
+    fast_lm = model._fast_lm
+    fast_diff = model._fast_diff
     embed_table = fast_lm.embed_w
     NL = config.num_hidden_layers
 
