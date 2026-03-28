@@ -17,6 +17,7 @@ from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.utils import tree_flatten
 
 from vibevoice_mlx.load_weights import (
     _load_safetensors, _map_hf_key, _quantize_predicate,
@@ -104,7 +105,7 @@ def convert_model(model_id: str, output_dir: Path, tokenizer_id: str | None = No
         )
 
         # Flatten quantized parameters back to saveable dict
-        quantized = dict(mx.tree_flatten(model.parameters()))
+        quantized = dict(tree_flatten(model.parameters()))
         # Re-add non-backbone weights (VAE, encoders)
         quantized.update(other_weights)
         mapped = quantized
