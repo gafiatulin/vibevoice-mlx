@@ -108,7 +108,10 @@ def convert_model(model_id: str, output_dir: Path, tokenizer_id: str | None = No
         quantized = dict(tree_flatten(model.parameters()))
         # Re-add non-backbone weights (VAE, encoders)
         quantized.update(other_weights)
-        mapped = quantized
+        # Cast float32/bfloat16 to float16 (matches load_model behavior)
+        mapped = {k: v.astype(mx.float16)
+                      if v.dtype in (mx.float32, mx.bfloat16) else v
+                  for k, v in quantized.items()}
         quantization_meta = {"bits": quantize_bits, "group_size": group_size}
 
     output_dir.mkdir(parents=True, exist_ok=True)
