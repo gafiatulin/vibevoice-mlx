@@ -482,6 +482,9 @@ def generate(
     metrics.total_time = (time.perf_counter() - t0_total) * 1000
     metrics.audio_samples = len(audio_out)
 
+    # Free MLX metal buffer pool so repeated calls don't grow unbounded.
+    mx.clear_cache()
+
     return audio_out, metrics
 
 
