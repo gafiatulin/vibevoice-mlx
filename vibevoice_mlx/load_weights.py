@@ -237,6 +237,19 @@ def load_model(
     vae_data = _map_mlx_vae_weights(vae_raw) if vae_keys else {}
     del vae_raw
 
+    # Extract acoustic encoder weights (for voice cloning) before discarding.
+    # Stored on model._encoder_weights so encode_voice_reference() can skip
+    # reloading all safetensors from disk.
+    has_enc = (
+        any(k.startswith("model.acoustic_tokenizer.encoder.") for k in raw_weights)
+        or any(k.startswith("acoustic_encoder.") for k in raw_weights)
+    )
+    if has_enc:
+        from .vae_encoder import load_vae_encoder_weights
+        model._encoder_weights = load_vae_encoder_weights(raw_weights)
+    else:
+        model._encoder_weights = None
+
     # Separate model weights (drop acoustic_encoder/semantic_encoder/vae_decoder
     # — these are loaded on-demand, not via nn.Module)
     manual_prefixes = ("vae_decoder.", "semantic_encoder.", "acoustic_encoder.")

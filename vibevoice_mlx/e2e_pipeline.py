@@ -116,24 +116,29 @@ def encode_voice_reference(
     from .vae_encoder import load_vae_encoder_weights, encode_audio
     from .load_weights import resolve_model_path, _load_safetensors
 
-    # Cache encoder weights across calls (avoid reloading safetensors from disk)
-    cache_key = model_id
-    if not hasattr(encode_voice_reference, "_enc_cache"):
-        encode_voice_reference._enc_cache = {}
-    if cache_key not in encode_voice_reference._enc_cache:
-        model_path = resolve_model_path(model_id)
-        raw = _load_safetensors(model_path)
-        has_enc = (
-            any(k.startswith("model.acoustic_tokenizer.encoder.") for k in raw)
-            or any(k.startswith("acoustic_encoder.") for k in raw)
-        )
-        if not has_enc:
-            raise RuntimeError(
-                f"No acoustic encoder weights found in {model_path}. "
-                "Re-convert the model to include encoder weights."
+    # Prefer pre-extracted encoder weights from load_model() to avoid
+    # reloading all safetensors (~18 GB for large models).
+    enc_weights = getattr(model, "_encoder_weights", None)
+
+    if enc_weights is None:
+        # Fallback: load from disk with per-model caching
+        cache_key = model_id
+        if not hasattr(encode_voice_reference, "_enc_cache"):
+            encode_voice_reference._enc_cache = {}
+        if cache_key not in encode_voice_reference._enc_cache:
+            model_path = resolve_model_path(model_id)
+            raw = _load_safetensors(model_path)
+            has_enc = (
+                any(k.startswith("model.acoustic_tokenizer.encoder.") for k in raw)
+                or any(k.startswith("acoustic_encoder.") for k in raw)
             )
-        encode_voice_reference._enc_cache[cache_key] = load_vae_encoder_weights(raw)
-    enc_weights = encode_voice_reference._enc_cache[cache_key]
+            if not has_enc:
+                raise RuntimeError(
+                    f"No acoustic encoder weights found in {model_path}. "
+                    "Re-convert the model to include encoder weights."
+                )
+            encode_voice_reference._enc_cache[cache_key] = load_vae_encoder_weights(raw)
+        enc_weights = encode_voice_reference._enc_cache[cache_key]
 
     # Pad/trim to VOICE_CLONE_SAMPLES
     audio_padded = np.zeros(VOICE_CLONE_SAMPLES, dtype=np.float32)
