@@ -10,6 +10,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import logging
 import math
 import os
 import re
@@ -26,6 +27,8 @@ import mlx.core as mx
 
 from .generate import GenerationOptions, generate
 from .load_weights import load_model, resolve_model_path
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +87,7 @@ def save_voice(path: str, embeds: np.ndarray):
     """Save pre-encoded voice embeddings to safetensors."""
     from safetensors.numpy import save_file
     save_file({"embeddings": embeds}, path)
-    print(f"Saved voice embeddings to {path} ({embeds.shape})")
+    logger.info("Saved voice embeddings to %s (%s)", path, embeds.shape)
 
 
 def load_voice(path: str) -> np.ndarray:
@@ -152,7 +155,7 @@ def encode_voice_reference(
     embeds = model.acoustic_connector(features)  # (1, T, hidden_size)
     mx.eval(embeds)
 
-    print(f"  Encoded voice: {actual_t} tokens")
+    logger.info("  Encoded voice: %d tokens", actual_t)
     return np.array(embeds[0])  # (T, hidden_size)
 
 
@@ -356,10 +359,10 @@ def _try_coreml_semantic(model, config):
             nonlocal sem_state
             sem_state = sem_enc.make_state()
 
-        print("Semantic encoder: CoreML + MLX connector")
+        logger.info("Semantic encoder: CoreML + MLX connector")
         return semantic_fn, reset_fn
     except Exception as e:
-        print(f"  CoreML semantic encoder failed: {e}")
+        logger.debug("  CoreML semantic encoder failed: %s", e)
         return None
 
 
@@ -369,7 +372,7 @@ def _try_mlx_semantic(model, config, model_id):
         from .semantic_encoder import load_semantic_encoder, FRAME_SAMPLES
         from .load_weights import resolve_model_path, _load_safetensors
 
-        print("Loading semantic encoder weights...")
+        logger.info("Loading semantic encoder weights...")
         model_path = resolve_model_path(model_id)
         raw = _load_safetensors(model_path)
 
@@ -377,7 +380,7 @@ def _try_mlx_semantic(model, config, model_id):
                     if k.startswith("model.semantic_tokenizer.encoder.")
                     or k.startswith("semantic_encoder.")}
         if not sem_keys:
-            print("  No semantic encoder weights found")
+            logger.info("  No semantic encoder weights found")
             return None
 
         sem_enc = load_semantic_encoder(raw)
@@ -400,10 +403,10 @@ def _try_mlx_semantic(model, config, model_id):
         def reset_fn():
             sem_enc.reset_caches()
 
-        print(f"Semantic encoder: MLX ({len(sem_enc.caches)} cache buffers)")
+        logger.info("Semantic encoder: MLX (%d cache buffers)", len(sem_enc.caches))
         return semantic_fn, reset_fn
     except Exception as e:
-        print(f"Warning: Could not load semantic encoder: {e}")
+        logger.warning("Could not load semantic encoder: %s", e)
         return None
 
 
@@ -415,6 +418,8 @@ def _detect_tokenizer(model_id: str, config) -> str:
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
     parser = argparse.ArgumentParser(description="VibeVoice MLX Text-to-Speech")
     parser.add_argument("--text", type=str, default=None, help="Text to synthesize")
     parser.add_argument("--model", type=str, default="gafiatulin/vibevoice-1.5b-mlx",

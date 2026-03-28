@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Optional
 
@@ -10,6 +11,8 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .model import VibeVoiceConfig, VibeVoiceModel
+
+logger = logging.getLogger(__name__)
 
 
 def resolve_model_path(model_id_or_path: str) -> Path:
@@ -190,13 +193,13 @@ def load_model(
     Returns:
         (model, config)
     """
-    print(f"Loading model from {model_id}...")
+    logger.info("Loading model from %s...", model_id)
     model_path = resolve_model_path(model_id)
     config = load_config(model_path)
 
-    print(f"  Config: {config.num_hidden_layers} layers, "
-          f"hidden={config.hidden_size}, heads={config.num_attention_heads}, "
-          f"tie_embeddings={config.tie_word_embeddings}")
+    logger.info("  Config: %d layers, hidden=%d, heads=%d, tie_embeddings=%s",
+                config.num_hidden_layers, config.hidden_size,
+                config.num_attention_heads, config.tie_word_embeddings)
 
     raw_weights = _load_safetensors(model_path)
 
@@ -205,7 +208,7 @@ def load_model(
     is_hf_format = any(k.startswith("model.language_model.") for k in raw_weights)
 
     if is_hf_format:
-        print("  Detected original HuggingFace format, remapping keys...")
+        logger.info("  Detected original HuggingFace format, remapping keys...")
         # Extract speech scaling/bias from weights before remapping (they are
         # stored as scalar tensors in HF checkpoints but used as config values)
         for wname, attr in [
@@ -221,9 +224,9 @@ def load_model(
                 mapped[mlx_name] = w
         raw_weights = mapped
     elif is_mlx_format:
-        print("  Detected MLX format")
+        logger.info("  Detected MLX format")
     else:
-        print("  Warning: Unknown weight format, attempting direct load")
+        logger.warning("  Unknown weight format, attempting direct load")
 
     # Create model
     model = VibeVoiceModel(config)
@@ -250,7 +253,7 @@ def load_model(
     del model_weights
 
     if quantize_bits is not None:
-        print(f"  Loading with INT{quantize_bits} quantization (per-layer eval)...")
+        logger.info("  Loading with INT%d quantization (per-layer eval)...", quantize_bits)
         lm_layer_weights = {}
         other_weights = []
 
@@ -301,7 +304,7 @@ def load_model(
 
     model.update(_cast_to_f16(model.parameters()))
     mx.eval(model.parameters())
-    print(f"  Model loaded successfully")
+    logger.info("  Model loaded successfully")
 
     return model, config
 
