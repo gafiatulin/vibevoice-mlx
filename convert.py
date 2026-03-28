@@ -7,6 +7,7 @@ Usage:
     uv run python convert.py --output-dir converted/ --models 1.5b
     uv run python convert.py --output-dir converted/ --upload --hf-prefix your-username
     uv run python convert.py --model-id kugelaudio/kugelaudio-0-open --output-dir converted/kugelaudio-mlx
+    uv run python convert.py --model-id microsoft/VibeVoice-1.5B --quantize 4 --output-dir converted/vibevoice-1.5b-int4-mlx
 """
 
 import argparse
@@ -15,8 +16,13 @@ import shutil
 from pathlib import Path
 
 import mlx.core as mx
+import mlx.nn as nn
 
-from vibevoice_mlx.load_weights import _load_safetensors, _map_hf_key, load_config, resolve_model_path
+from vibevoice_mlx.load_weights import (
+    _load_safetensors, _map_hf_key, _quantize_predicate,
+    load_config, resolve_model_path,
+)
+from vibevoice_mlx.model import VibeVoiceModel
 
 MODEL_IDS = {
     "1.5b": "microsoft/VibeVoice-1.5B",
@@ -39,10 +45,11 @@ def _detect_tokenizer_id(config) -> str:
     return "Qwen/Qwen2.5-7B"
 
 
-def convert_model(model_id: str, output_dir: Path, tokenizer_id: str | None = None):
+def convert_model(model_id: str, output_dir: Path, tokenizer_id: str | None = None,
+                   quantize_bits: int | None = None):
     """Convert a VibeVoice-compatible model to MLX format."""
     print(f"\n{'='*60}")
-    print(f"Converting {model_id}")
+    print(f"Converting {model_id}" + (f" (INT{quantize_bits})" if quantize_bits else ""))
     print(f"{'='*60}")
 
     model_path = resolve_model_path(model_id)
@@ -72,6 +79,36 @@ def convert_model(model_id: str, output_dir: Path, tokenizer_id: str | None = No
             skipped.append(name)
 
     print(f"  Mapped {len(mapped)} weights, skipped {len(skipped)}")
+
+    # Quantize if requested: load into model, quantize, then flatten back
+    quantization_meta = None
+    if quantize_bits is not None:
+        group_size = 64 if quantize_bits == 4 else 32
+        print(f"  Quantizing to INT{quantize_bits} (group_size={group_size})...")
+
+        model = VibeVoiceModel(config)
+        # Separate model backbone weights from VAE/encoder
+        manual_prefixes = ("vae_decoder.", "semantic_encoder.", "acoustic_encoder.")
+        backbone_weights = {k: v for k, v in mapped.items()
+                           if not any(k.startswith(p) for p in manual_prefixes)}
+        other_weights = {k: v for k, v in mapped.items()
+                        if any(k.startswith(p) for p in manual_prefixes)}
+
+        if config.tie_word_embeddings:
+            backbone_weights.pop("lm_head.weight", None)
+
+        model.load_weights(list(backbone_weights.items()), strict=False)
+        nn.quantize(
+            model.model, bits=quantize_bits, group_size=group_size,
+            class_predicate=_quantize_predicate,
+        )
+
+        # Flatten quantized parameters back to saveable dict
+        quantized = dict(mx.tree_flatten(model.parameters()))
+        # Re-add non-backbone weights (VAE, encoders)
+        quantized.update(other_weights)
+        mapped = quantized
+        quantization_meta = {"bits": quantize_bits, "group_size": group_size}
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -106,6 +143,8 @@ def convert_model(model_id: str, output_dir: Path, tokenizer_id: str | None = No
         "speech_diffusion_id": config.speech_diffusion_id,
         "eos_id": config.eos_id,
     }
+    if quantization_meta is not None:
+        config_dict["quantization"] = quantization_meta
     with open(output_dir / "config.json", "w") as f:
         json.dump(config_dict, f, indent=2)
 
@@ -201,6 +240,8 @@ def main():
                         help="Built-in model tags to convert (1.5b, 7b)")
     parser.add_argument("--model-id", type=str, default=None,
                         help="Arbitrary HuggingFace model ID to convert")
+    parser.add_argument("--quantize", type=int, choices=[4, 8], default=None,
+                        help="Save pre-quantized weights (int4 or int8)")
     parser.add_argument("--tokenizer", type=str, default=None,
                         help="Tokenizer ID (auto-detected if not specified)")
     parser.add_argument("--upload", action="store_true", help="Upload to HuggingFace")
@@ -212,7 +253,8 @@ def main():
     if args.model_id:
         # Convert arbitrary model
         out = base if base.name != "converted" else base / (args.model_id.replace("/", "-") + "-mlx")
-        convert_model(args.model_id, out, tokenizer_id=args.tokenizer)
+        convert_model(args.model_id, out, tokenizer_id=args.tokenizer,
+                      quantize_bits=args.quantize)
         if args.upload:
             repo_id = f"{args.hf_prefix}/{out.name}"
             upload(out, repo_id)
@@ -222,7 +264,8 @@ def main():
         for tag in tags:
             model_id = MODEL_IDS[tag]
             out = base / f"vibevoice-{tag}-mlx"
-            convert_model(model_id, out, tokenizer_id=TOKENIZER_IDS[tag])
+            convert_model(model_id, out, tokenizer_id=TOKENIZER_IDS[tag],
+                          quantize_bits=args.quantize)
             if args.upload:
                 upload(out, f"{args.hf_prefix}/vibevoice-{tag}-mlx")
 

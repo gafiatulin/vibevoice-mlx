@@ -84,6 +84,7 @@ def load_config(model_path: Path) -> VibeVoiceConfig:
         speech_diffusion_id=_get("speech_diffusion_id", default=151654),
         eos_id=_get("eos_id", default=151643),
         single_segment=_get("single_segment", default=is_kugelaudio),
+        quantization=raw.get("quantization", None),
     )
 
 
@@ -180,15 +181,29 @@ def _map_mlx_vae_weights(raw: dict[str, mx.array]) -> dict[str, mx.array]:
     return result
 
 
+def _quantize_predicate(_, m):
+    """Quantize nn.Linear layers with dimensions divisible by 64."""
+    return (
+        isinstance(m, nn.Linear)
+        and m.weight.shape[0] % 64 == 0
+        and m.weight.shape[1] % 64 == 0
+    )
+
+
 def load_model(
     model_id: str,
     quantize_bits: Optional[int] = None,
 ) -> tuple[VibeVoiceModel, VibeVoiceConfig]:
     """Load VibeVoice model from HuggingFace.
 
+    Supports three modes:
+    - Pre-quantized weights (config.quantization is set): loads directly
+    - Runtime quantization (quantize_bits is set): load fp16, then quantize
+    - Full precision (default): load fp16
+
     Args:
         model_id: HuggingFace model ID or local path
-        quantize_bits: None or 8 for INT8 quantization on LLM backbone
+        quantize_bits: None or 4/8 for runtime INT4/INT8 quantization
 
     Returns:
         (model, config)
@@ -265,7 +280,18 @@ def load_model(
     weight_pairs = list(model_weights.items())
     del model_weights
 
-    if quantize_bits is not None:
+    # Pre-quantized weights: convert layer types first, then load directly
+    if config.quantization is not None and quantize_bits is None:
+        bits = config.quantization["bits"]
+        group_size = config.quantization["group_size"]
+        logger.info("  Loading pre-quantized INT%d weights (group_size=%d)...", bits, group_size)
+        nn.quantize(
+            model.model, bits=bits, group_size=group_size,
+            class_predicate=_quantize_predicate,
+        )
+        model.load_weights(weight_pairs, strict=False)
+        del weight_pairs
+    elif quantize_bits is not None:
         logger.info("  Loading with INT%d quantization (per-layer eval)...", quantize_bits)
         lm_layer_weights = {}
         other_weights = []
@@ -290,14 +316,9 @@ def load_model(
         del lm_layer_weights
 
         nn.quantize(
-            model.model,
-            bits=quantize_bits,
+            model.model, bits=quantize_bits,
             group_size=64 if quantize_bits == 4 else 32,
-            class_predicate=lambda _, m: (
-                isinstance(m, nn.Linear)
-                and m.weight.shape[0] % 64 == 0
-                and m.weight.shape[1] % 64 == 0
-            ),
+            class_predicate=_quantize_predicate,
         )
     else:
         model.load_weights(weight_pairs)

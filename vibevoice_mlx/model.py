@@ -52,6 +52,8 @@ class VibeVoiceConfig:
     eos_id: int = 151643
     # Model variant behavior (auto-detected from config)
     single_segment: bool = False  # True for KugelAudio-family models
+    # Pre-quantized weight metadata (None = fp16, set by pre-quantized repos)
+    quantization: dict | None = None
 
 
 # ---------------------------------------------------------------------------
