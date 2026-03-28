@@ -165,14 +165,16 @@ def tokenize_text(
     tokenizer_name: str,
     config,
     ref_audio: list[str] | None = None,
+    tokenizer=None,
 ) -> list[int] | VoiceCloneData:
     """Build the full prompt token sequence for TTS.
 
     If ref_audio is provided, returns VoiceCloneData with per-speaker
     embedding positions for voice cloning injection during prefill.
     """
-    from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
+    if tokenizer is None:
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
 
     system_prompt = " Transform the text provided by various speakers into speech output, utilizing the distinct voice of each respective speaker.\n"
     system_tokens = tokenizer.encode(system_prompt)
