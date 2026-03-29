@@ -40,7 +40,11 @@ class GenerationOptions:
     diffusion_steps: int = 10      # DPM-Solver++ steps
     cfg_scale: float = 1.3         # Classifier-free guidance
     max_speech_tokens: int = 200   # Safety limit
-    silence_detection: bool = False  # Stop on sustained silence + trim trailing
+    silence_detection: bool = False  # Boost speech_end logit on sustained silence
+    trim_trailing_silence: bool | None = None  # Post-gen trim (None = follow silence_detection)
+    silence_threshold: float = 0.05  # RMS threshold for silence detection
+    silence_min_duration_ms: int = 1500  # Forward scan: min silence gap to cut
+    silence_pad_ms: int = 300      # Padding after detected speech end
     seed: int = 42
 
 
@@ -477,8 +481,14 @@ def generate(
         full_audio = model.vae_decoder(full_latent)
         mx.eval(full_audio)
         audio_out = np.array(full_audio).squeeze().astype(np.float32)
-        if opts.silence_detection:
-            audio_out = _trim_trailing_silence(audio_out)
+        do_trim = opts.trim_trailing_silence if opts.trim_trailing_silence is not None else opts.silence_detection
+        if do_trim:
+            audio_out = _trim_trailing_silence(
+                audio_out,
+                threshold=opts.silence_threshold,
+                long_silence_ms=opts.silence_min_duration_ms,
+                pad_ms=opts.silence_pad_ms,
+            )
         metrics.record("vae_final", (time.perf_counter() - t0) * 1000)
     else:
         audio_out = np.zeros(0, dtype=np.float32)
@@ -495,7 +505,7 @@ def generate(
 def _trim_trailing_silence(audio: np.ndarray, sr: int = 24000,
                            threshold: float = 0.05,
                            long_silence_ms: int = 1500,
-                           pad_ms: int = 150) -> np.ndarray:
+                           pad_ms: int = 300) -> np.ndarray:
     """Trim audio after speech ends.
 
     Two-pass approach:

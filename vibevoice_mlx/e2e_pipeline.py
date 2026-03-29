@@ -466,7 +466,17 @@ def main():
     parser.add_argument("--max-speech-tokens", type=int, default=200,
                         help="Maximum speech tokens to generate")
     parser.add_argument("--silence-detection", action="store_true",
-                        help="Detect end of speech via latent energy (for models that don't stop naturally)")
+                        help="Boost speech_end logit on sustained silence (for models that don't stop naturally)")
+    parser.add_argument("--trim-trailing-silence", action="store_true", default=None,
+                        help="Trim trailing silence from generated audio (default: follows --silence-detection)")
+    parser.add_argument("--no-trim-trailing-silence", dest="trim_trailing_silence", action="store_false",
+                        help="Disable trailing silence trimming even with --silence-detection")
+    parser.add_argument("--silence-threshold", type=float, default=0.05,
+                        help="RMS threshold for silence detection (default: 0.05)")
+    parser.add_argument("--silence-min-duration-ms", type=int, default=1500,
+                        help="Minimum silence duration (ms) before cutting (default: 1500)")
+    parser.add_argument("--silence-pad-ms", type=int, default=300,
+                        help="Padding (ms) after detected speech end (default: 300)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--no-semantic", action="store_true",
                         help="Skip semantic feedback (faster, lower quality)")
@@ -581,6 +591,10 @@ def main():
         cfg_scale=args.cfg_scale,
         max_speech_tokens=args.max_speech_tokens,
         silence_detection=args.silence_detection,
+        trim_trailing_silence=args.trim_trailing_silence,
+        silence_threshold=args.silence_threshold,
+        silence_min_duration_ms=args.silence_min_duration_ms,
+        silence_pad_ms=args.silence_pad_ms,
         seed=args.seed,
     )
 
